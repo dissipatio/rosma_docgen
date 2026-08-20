@@ -87,13 +87,18 @@ HEADERS = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
 # --------------------------------------------------------------------------
 
 def _get_record(table_id, record_id):
-    r = requests.get(f"{API_BASE}/{BASE_ID}/{table_id}/{record_id}", headers=HEADERS, timeout=30)
+    r = requests.get(
+        f"{API_BASE}/{BASE_ID}/{table_id}/{record_id}",
+        headers=HEADERS,
+        params={"returnFieldsByFieldId": "true"},
+        timeout=30,
+    )
     r.raise_for_status()
     return r.json()
 
 
 def _list_records(table_id, filter_formula=None):
-    records, params = [], {}
+    records, params = [], {"returnFieldsByFieldId": "true"}
     if filter_formula:
         params["filterByFormula"] = filter_formula
     url = f"{API_BASE}/{BASE_ID}/{table_id}"
