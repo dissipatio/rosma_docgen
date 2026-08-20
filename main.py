@@ -20,11 +20,12 @@ import os
 import shutil
 import subprocess
 import tempfile
-import uuid
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+
+from pdf_convert import docx_to_pdf
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,62 +34,6 @@ logging.basicConfig(
 log = logging.getLogger("docgen")
 
 app = FastAPI(title="ROSMA docgen")
-
-SOFFICE_TIMEOUT = int(os.getenv("SOFFICE_TIMEOUT", "120"))
-
-
-# --------------------------------------------------------------------------
-# LibreOffice conversion
-# --------------------------------------------------------------------------
-
-def docx_to_pdf(docx_path: Path, out_dir: Path) -> Path:
-    """
-    Convert a .docx to .pdf using headless LibreOffice.
-
-    Each call gets its own UserInstallation profile directory. Without this,
-    two concurrent conversions fight over the same profile and one of them
-    silently produces nothing.
-    """
-    profile = Path(tempfile.gettempdir()) / f"lo_{uuid.uuid4().hex}"
-    profile.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        "soffice",
-        "--headless",
-        "--norestore",
-        "--invisible",
-        f"-env:UserInstallation=file://{profile}",
-        "--convert-to", "pdf:writer_pdf_Export",
-        "--outdir", str(out_dir),
-        str(docx_path),
-    ]
-
-    log.info("Converting %s -> pdf", docx_path.name)
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=SOFFICE_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"LibreOffice timed out after {SOFFICE_TIMEOUT}s")
-    finally:
-        shutil.rmtree(profile, ignore_errors=True)
-
-    pdf_path = out_dir / (docx_path.stem + ".pdf")
-
-    # soffice frequently exits 0 even when it produced nothing, so check the file.
-    if not pdf_path.exists():
-        raise RuntimeError(
-            f"LibreOffice produced no PDF.\n"
-            f"returncode={proc.returncode}\n"
-            f"stdout={proc.stdout}\n"
-            f"stderr={proc.stderr}"
-        )
-
-    log.info("Converted OK: %s (%d bytes)", pdf_path.name, pdf_path.stat().st_size)
-    return pdf_path
 
 
 # --------------------------------------------------------------------------
@@ -241,31 +186,35 @@ async def render_test(
 
 
 # --------------------------------------------------------------------------
-# Stage 2 placeholder
+# Stage 2 — real Airtable-driven generation
 # --------------------------------------------------------------------------
 
 @app.post("/generate")
+@app.post("/generate-document")  # alias — matches the Airtable Automation's webhook URL
 async def generate(payload: dict, background_tasks: BackgroundTasks):
     """
-    Airtable-triggered generation. Returns 202 immediately because
-    LibreOffice conversion takes longer than Airtable's automation timeout.
+    Airtable-triggered generation, fired by the "Сгенерировать документ"
+    checkbox on Inquiries. Returns 202 immediately because LibreOffice
+    conversion + the Yandex Disk upload take longer than Airtable's webhook
+    timeout — generate_document_for_record() writes its own result (link,
+    status, error) back to the Inquiry record regardless of this response.
 
-    Wired up in Stage 2, once the placeholder -> field mapping exists.
+    doc_type is accepted for backward compatibility with the original Stage
+    1 stub, but is no longer required: the template to use is read from the
+    Inquiry's own "Шаблон для генерации" link field, per the data-driven
+    Doc Templates / Doc Field Map design — adding a new template means
+    adding Airtable rows, not changing what this endpoint expects.
     """
+    from generate_and_deliver import generate_document_for_record
+
     record_id = payload.get("record_id")
-    doc_type = payload.get("doc_type")
+    if not record_id:
+        raise HTTPException(400, "record_id is required")
 
-    if not record_id or not doc_type:
-        raise HTTPException(400, "record_id and doc_type are required")
-
-    log.info("Generate requested: %s / %s (stub)", doc_type, record_id)
+    log.info("Generate requested for %s", record_id)
+    background_tasks.add_task(generate_document_for_record, record_id)
 
     return JSONResponse(
         status_code=202,
-        content={
-            "accepted": True,
-            "record_id": record_id,
-            "doc_type": doc_type,
-            "note": "Stage 1 stub — Airtable wiring lands in Stage 2.",
-        },
+        content={"accepted": True, "record_id": record_id},
     )
