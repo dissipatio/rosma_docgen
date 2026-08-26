@@ -271,8 +271,20 @@ def _load_template_record(template_name):
 
 
 def _load_field_map_rows(template_record_id):
-    formula = f"FIND('{template_record_id}', ARRAYJOIN({{{FLD_MAP_TEMPLATE_LINK}}})) > 0"
-    return _list_records(DOC_FIELD_MAP_TABLE, filter_formula=formula)
+    # NOTE: deliberately NOT using filterByFormula here. A formula like
+    # FIND('{template_record_id}', ARRAYJOIN({Template})) looks correct but
+    # silently matches zero rows -- ARRAYJOIN() on a linked-record field
+    # returns the linked record's DISPLAY NAME, not its record ID. Doc
+    # Field Map is small (~80 rows total), so fetching everything and
+    # filtering in Python avoids the gotcha entirely.
+    all_rows = _list_records(DOC_FIELD_MAP_TABLE)
+    matched = []
+    for row in all_rows:
+        links = _field(row, FLD_MAP_TEMPLATE_LINK, [])
+        linked_ids = [link.get("id") if isinstance(link, dict) else link for link in links]
+        if template_record_id in linked_ids:
+            matched.append(row)
+    return matched
 
 
 # --------------------------------------------------------------------------
