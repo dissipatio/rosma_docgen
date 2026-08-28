@@ -94,7 +94,13 @@ def generate_document_for_record(record_id):
         docx_path, pdf_path = doc_render.render_document(template_name, record_id, make_pdf=True)
 
         yd.ensure_folder_exists()
-        remote_filename = os.path.basename(pdf_path)
+        # NOTE: local docx/pdf filenames keep the readable "B-522 — КП Китай.pdf"
+        # form (see doc_render.py) -- that's fine locally. But Yandex Disk's API
+        # mishandled that same filename in a path parameter: spaces got encoded
+        # as '+', which is only valid in form bodies, not URL paths, and Yandex's
+        # server returned a 500 rather than a clean error. Keep the remote name
+        # plain ASCII to sidestep this entirely.
+        remote_filename = f"{record_id}.pdf"
         public_url = yd.upload_and_publish(pdf_path, remote_filename)
 
         _update_inquiry(record_id, {
