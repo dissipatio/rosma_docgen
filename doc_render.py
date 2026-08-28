@@ -23,13 +23,52 @@ from pathlib import Path
 
 import requests
 
-from docxtpl import DocxTemplate
+from docxtpl import DocxTemplate, InlineImage
+from docx.shared import Mm
 
 from pdf_convert import docx_to_pdf  # shared with main.py -- same LibreOffice call, same profile-isolation fix
 import doc_resolver as resolver  # reuses BASE_ID, API_BASE, HEADERS, etc.
 
 # Doc Templates field IDs (see doc_resolver.py for the full list)
 FLD_TPL_TEMPLATE_FILE = "flduRSPDOi4D8KHgR"  # "Template file" attachment field, confirmed via get_table_schema
+
+# Default rendered width for stamp/signature images. Both source images in
+# the first template using this (~23mm and ~38mm) fell in this range: one
+# width for both keeps this simple, and docxtpl preserves aspect ratio when
+# only width is given. Revisit if a template needs the two sized differently.
+IMAGE_WIDTH_MM = 30
+
+
+def _download_to_temp(url, output_dir, suffix):
+    """Downloads an arbitrary URL (e.g. a stamp/signature attachment) to a
+    temp file in output_dir. Returns the local path, or None if url is
+    falsy (e.g. no attachment uploaded yet for this field)."""
+    if not url:
+        return None
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    path = os.path.join(output_dir, f"_image_{suffix}")
+    with open(path, "wb") as f:
+        f.write(r.content)
+    return path
+
+
+def _resolve_image_fields(context, doc, output_dir):
+    """Mutates context in place: for every jinja_var listed in
+    context["_meta"]["image_fields"] (populated by doc_resolver for Image
+    scope rows), downloads the attachment URL and replaces the context
+    value with a real docxtpl InlineImage. A field with no attachment
+    uploaded yet (context value is None) is left as None -- docxtpl then
+    renders that {{ tag }} as blank rather than erroring, so a document can
+    still be generated before every stamp/signature is uploaded."""
+    image_fields = context.get("_meta", {}).get("image_fields", [])
+    for jinja_var in image_fields:
+        url = context.get(jinja_var)
+        if not url:
+            context[jinja_var] = None
+            continue
+        local_path = _download_to_temp(url, output_dir, jinja_var)
+        context[jinja_var] = InlineImage(doc, local_path, width=Mm(IMAGE_WIDTH_MM))
 
 
 def _get_template_file_url(template_record):
@@ -75,6 +114,7 @@ def render_document(template_name, inquiry_ref, output_dir=None, make_pdf=True):
               f"'Not built' in Doc Field Map were skipped.", file=sys.stderr)
 
     doc = DocxTemplate(template_local_path)
+    _resolve_image_fields(context, doc, output_dir)
     doc.render(context)
 
     safe_inquiry = str(inquiry_ref).replace("/", "-")

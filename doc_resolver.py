@@ -249,10 +249,29 @@ def _rule_number_to_words_ru(ctx):
     return f"{words} {currency_word}"
 
 
+import datetime
+
+RU_MONTHS_GENITIVE = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+
+def _rule_today_date_ru(ctx):
+    return datetime.date.today().strftime("%d.%m.%Y")
+
+
+def _rule_today_date_ru_long(ctx):
+    today = datetime.date.today()
+    return f"{today.day} {RU_MONTHS_GENITIVE[today.month - 1]} {today.year}"
+
+
 COMPUTED_REGISTRY = {
     "sum_line_items": lambda ctx: round(sum(_line_sum(p) for p in ctx["products"]), 2),
     "vat_inclusive_tax_value": _rule_vat_inclusive_tax_value,
     "number_to_words_ru": _rule_number_to_words_ru,
+    "today_date_ru": _rule_today_date_ru,
+    "today_date_ru_long": _rule_today_date_ru_long,
     "row_index": None,  # handled inline in the row loop, not called generically
     "currency_symbol": None,  # in practice resolved as a Header lookup, not computed -- kept for schema completeness
 }
@@ -314,6 +333,7 @@ def build_context(template_name, inquiry_ref):
     row_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Row"]
     computed_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Computed"]
     static_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Static constant"]
+    image_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Image"]
     skipped = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) in ("Not built", "")]
 
     context = {}
@@ -326,6 +346,24 @@ def build_context(template_name, inquiry_ref):
             continue
         value = _resolve_chain(root_record, chain)
         context[jinja_var] = _select_name(value) if isinstance(value, dict) else value
+
+    # --- Image fields (stamp/signature, etc.) -- chain must end in an
+    # Attachment field. Resolve to the first attachment's URL (a plain
+    # string), not the normal select/scalar handling. doc_render.py
+    # downloads this URL and swaps it for a real docxtpl InlineImage right
+    # before rendering -- see context["_meta"]["image_fields"].
+    image_field_vars = []
+    for row in image_rows:
+        jinja_var = _field(row, FLD_MAP_JINJA_VAR)
+        chain = _field(row, FLD_MAP_FIELD_ID_CHAIN)
+        if not jinja_var or not chain:
+            continue
+        value = _resolve_chain(root_record, chain)
+        if isinstance(value, list) and value and isinstance(value[0], dict) and "url" in value[0]:
+            context[jinja_var] = value[0]["url"]
+        else:
+            context[jinja_var] = None  # no attachment uploaded yet -- renders as a blank space, not an error
+        image_field_vars.append(jinja_var)
 
     # --- Row fields ---
     item_ids = _field(root_record, FLD_INQ_ITEMS_LINK, [])
@@ -374,6 +412,7 @@ def build_context(template_name, inquiry_ref):
     context["_meta"] = {
         "template": template_name,
         "skipped_placeholders": [_field(r, FLD_MAP_PLACEHOLDER) for r in skipped],
+        "image_fields": image_field_vars,
     }
     return context
 
