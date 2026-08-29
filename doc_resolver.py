@@ -129,8 +129,15 @@ def _multiselect_names(value):
     return [v.get("name", "") if isinstance(v, dict) else v for v in value]
 
 
-@lru_cache(maxsize=None)
 def _cached_record(table_id, record_id):
+    # NOTE: intentionally NOT cached across calls (no @lru_cache here).
+    # This is called for records that get edited between renders in normal
+    # operation -- Our company (stamps/signatures), Clients, Employees,
+    # Goods, etc. main.py runs as a persistent process, not restarted per
+    # request, so a process-lifetime cache would silently serve stale data
+    # (e.g. a stamp uploaded after this record was first fetched) until the
+    # next deploy. The extra API calls this costs are cheap relative to
+    # correctness here.
     return _get_record(table_id, record_id)
 
 
