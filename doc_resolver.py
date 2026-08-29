@@ -72,6 +72,7 @@ FLD_MAP_STATUS = "fldDGSCvew021kVBo"
 
 # Inquiries field IDs needed to find the row source
 FLD_INQ_ITEMS_LINK = "fldYy6SrZebO9mrQZ"
+FLD_INQ_NO_STAMP_SIGNATURE = "fldDDtAJvvo1uk94A"  # "Без печати и подписи" checkbox -- forces stamp/signature blank when checked
 
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY", "").strip()
 if not AIRTABLE_API_KEY:
@@ -359,11 +360,21 @@ def build_context(template_name, inquiry_ref):
     # string), not the normal select/scalar handling. doc_render.py
     # downloads this URL and swaps it for a real docxtpl InlineImage right
     # before rendering -- see context["_meta"]["image_fields"].
+    #
+    # "Без печати и подписи" checkbox on the Inquiry overrides this per
+    # document: when checked, every image field is forced blank even if the
+    # company record has real stamp/signature attachments uploaded -- e.g.
+    # for sending an unstamped draft for review before signing.
+    no_stamp_signature = bool(_field(root_record, FLD_INQ_NO_STAMP_SIGNATURE, False))
     image_field_vars = []
     for row in image_rows:
         jinja_var = _field(row, FLD_MAP_JINJA_VAR)
         chain = _field(row, FLD_MAP_FIELD_ID_CHAIN)
         if not jinja_var or not chain:
+            continue
+        if no_stamp_signature:
+            context[jinja_var] = None
+            image_field_vars.append(jinja_var)
             continue
         value = _resolve_chain(root_record, chain)
         if isinstance(value, list) and value and isinstance(value[0], dict) and "url" in value[0]:
