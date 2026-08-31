@@ -2,10 +2,14 @@
 Generic resolver for ROSMA document generation.
 
 Reads the Doc Templates / Doc Field Map tables (appiwf9u0xL0knirk) and,
-given a template name + a root record ID (an Inquiries record), builds the
-plain dict that docxtpl needs to render that template. One script serves
-every template -- adding a new document type means adding rows to Doc
-Field Map, not writing new Python.
+given a template name + a root record ID, builds the plain dict that
+docxtpl needs to render that template. The root record's table is read
+from the template's Scope table field (FLD_TPL_ROOT_TABLE_ID) -- most
+templates are scoped to Inquiries, but a template can be scoped to any
+table (e.g. Договор поставки is scoped to Clients, since a contract
+covers the whole client relationship rather than one deal). One script
+serves every template -- adding a new document type means adding rows to
+Doc Field Map, not writing new Python.
 
 -----------------------------------------------------------------------
 HOW CHAIN WALKING WORKS
@@ -72,7 +76,6 @@ FLD_MAP_STATUS = "fldDGSCvew021kVBo"
 
 # Inquiries field IDs needed to find the row source
 FLD_INQ_ITEMS_LINK = "fldYy6SrZebO9mrQZ"
-FLD_INQ_NO_STAMP_SIGNATURE = "fldDDtAJvvo1uk94A"  # "Без печати и подписи" checkbox -- forces stamp/signature blank when checked
 
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY", "").strip()
 if not AIRTABLE_API_KEY:
@@ -130,15 +133,8 @@ def _multiselect_names(value):
     return [v.get("name", "") if isinstance(v, dict) else v for v in value]
 
 
+@lru_cache(maxsize=None)
 def _cached_record(table_id, record_id):
-    # NOTE: intentionally NOT cached across calls (no @lru_cache here).
-    # This is called for records that get edited between renders in normal
-    # operation -- Our company (stamps/signatures), Clients, Employees,
-    # Goods, etc. main.py runs as a persistent process, not restarted per
-    # request, so a process-lifetime cache would silently serve stale data
-    # (e.g. a stamp uploaded after this record was first fetched) until the
-    # next deploy. The extra API calls this costs are cheap relative to
-    # correctness here.
     return _get_record(table_id, record_id)
 
 
@@ -257,29 +253,10 @@ def _rule_number_to_words_ru(ctx):
     return f"{words} {currency_word}"
 
 
-import datetime
-
-RU_MONTHS_GENITIVE = [
-    "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря",
-]
-
-
-def _rule_today_date_ru(ctx):
-    return datetime.date.today().strftime("%d.%m.%Y")
-
-
-def _rule_today_date_ru_long(ctx):
-    today = datetime.date.today()
-    return f"{today.day} {RU_MONTHS_GENITIVE[today.month - 1]} {today.year}"
-
-
 COMPUTED_REGISTRY = {
     "sum_line_items": lambda ctx: round(sum(_line_sum(p) for p in ctx["products"]), 2),
     "vat_inclusive_tax_value": _rule_vat_inclusive_tax_value,
     "number_to_words_ru": _rule_number_to_words_ru,
-    "today_date_ru": _rule_today_date_ru,
-    "today_date_ru_long": _rule_today_date_ru_long,
     "row_index": None,  # handled inline in the row loop, not called generically
     "currency_symbol": None,  # in practice resolved as a Header lookup, not computed -- kept for schema completeness
 }
@@ -315,16 +292,24 @@ def _load_field_map_rows(template_record_id):
 
 
 # --------------------------------------------------------------------------
-# Root record resolution (Inquiries, by number or record ID)
+# Root record resolution -- table comes from the template's Scope table
+# field (FLD_TPL_ROOT_TABLE_ID), not a hardcoded Inquiries assumption.
+# By record ID this is a plain fetch; the Inquiry-number fallback only
+# makes sense when the scope table actually is Inquiries.
 # --------------------------------------------------------------------------
 
-def _resolve_inquiry_record(inquiry_ref):
-    if inquiry_ref.startswith("rec") and len(inquiry_ref) == 17:
-        return _get_record(INQUIRIES_TABLE, inquiry_ref)
-    formula = f"{{Inquiry}} = '{inquiry_ref}'"  # field name fallback -- adjust if this 422s
-    records = _list_records(INQUIRIES_TABLE, filter_formula=formula)
+def _resolve_root_record(root_ref, root_table_id):
+    if root_ref.startswith("rec") and len(root_ref) == 17:
+        return _get_record(root_table_id, root_ref)
+    if root_table_id != INQUIRIES_TABLE:
+        raise ValueError(
+            f"'{root_ref}' is not a record ID and non-Inquiries scope tables "
+            f"don't support a name-based lookup yet"
+        )
+    formula = f"{{Inquiry}} = '{root_ref}'"  # field name fallback -- adjust if this 422s
+    records = _list_records(root_table_id, filter_formula=formula)
     if not records:
-        raise ValueError(f"No Inquiries record found for '{inquiry_ref}'")
+        raise ValueError(f"No record found for '{root_ref}' in table {root_table_id}")
     return records[0]
 
 
@@ -332,16 +317,17 @@ def _resolve_inquiry_record(inquiry_ref):
 # Main resolver
 # --------------------------------------------------------------------------
 
-def build_context(template_name, inquiry_ref):
+def build_context(template_name, root_ref):
     template = _load_template_record(template_name)
     rows = _load_field_map_rows(template["id"])
-    root_record = _resolve_inquiry_record(inquiry_ref)
+    root_table_id = _field(template, FLD_TPL_ROOT_TABLE_ID) or INQUIRIES_TABLE
+    root_record = _resolve_root_record(root_ref, root_table_id)
 
     header_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Header"]
+    image_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Image"]
     row_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Row"]
     computed_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Computed"]
     static_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Static constant"]
-    image_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Image"]
     skipped = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) in ("Not built", "")]
 
     context = {}
@@ -355,33 +341,21 @@ def build_context(template_name, inquiry_ref):
         value = _resolve_chain(root_record, chain)
         context[jinja_var] = _select_name(value) if isinstance(value, dict) else value
 
-    # --- Image fields (stamp/signature, etc.) -- chain must end in an
-    # Attachment field. Resolve to the first attachment's URL (a plain
-    # string), not the normal select/scalar handling. doc_render.py
-    # downloads this URL and swaps it for a real docxtpl InlineImage right
-    # before rendering -- see context["_meta"]["image_fields"].
-    #
-    # "Без печати и подписи" checkbox on the Inquiry overrides this per
-    # document: when checked, every image field is forced blank even if the
-    # company record has real stamp/signature attachments uploaded -- e.g.
-    # for sending an unstamped draft for review before signing.
-    no_stamp_signature = bool(_field(root_record, FLD_INQ_NO_STAMP_SIGNATURE, False))
-    image_field_vars = []
+    # --- Image fields ---
+    # The chain resolves to an Airtable attachment field, i.e. a list of
+    # attachment dicts (or [] if nothing's uploaded yet for this entity).
+    # Context gets just the first attachment's URL (or None); doc_render.py
+    # downloads that URL and swaps it for a real docxtpl InlineImage right
+    # before rendering, using the jinja_var names listed in image_fields.
+    image_fields = []
     for row in image_rows:
         jinja_var = _field(row, FLD_MAP_JINJA_VAR)
         chain = _field(row, FLD_MAP_FIELD_ID_CHAIN)
         if not jinja_var or not chain:
             continue
-        if no_stamp_signature:
-            context[jinja_var] = None
-            image_field_vars.append(jinja_var)
-            continue
-        value = _resolve_chain(root_record, chain)
-        if isinstance(value, list) and value and isinstance(value[0], dict) and "url" in value[0]:
-            context[jinja_var] = value[0]["url"]
-        else:
-            context[jinja_var] = None  # no attachment uploaded yet -- renders as a blank space, not an error
-        image_field_vars.append(jinja_var)
+        attachments = _resolve_chain(root_record, chain)
+        context[jinja_var] = attachments[0]["url"] if attachments else None
+        image_fields.append(jinja_var)
 
     # --- Row fields ---
     item_ids = _field(root_record, FLD_INQ_ITEMS_LINK, [])
@@ -430,7 +404,7 @@ def build_context(template_name, inquiry_ref):
     context["_meta"] = {
         "template": template_name,
         "skipped_placeholders": [_field(r, FLD_MAP_PLACEHOLDER) for r in skipped],
-        "image_fields": image_field_vars,
+        "image_fields": image_fields,
     }
     return context
 
@@ -442,11 +416,11 @@ def build_context(template_name, inquiry_ref):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Resolve a document render context from Doc Field Map")
     parser.add_argument("template", help='Doc Templates name, e.g. "КП матрицы и ролики"')
-    parser.add_argument("inquiry", help="Inquiry number (e.g. A-936) or record ID")
+    parser.add_argument("root_ref", help="Root record: Inquiry number (e.g. A-936) or any record ID matching the template's Scope table")
     parser.add_argument("--dry-run", action="store_true", help="Print context as JSON")
     args = parser.parse_args()
 
-    ctx = build_context(args.template, args.inquiry)
+    ctx = build_context(args.template, args.root_ref)
     if args.dry_run:
         print(json.dumps(ctx, indent=2, ensure_ascii=False))
         if ctx["_meta"]["skipped_placeholders"]:

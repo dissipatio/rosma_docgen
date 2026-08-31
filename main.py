@@ -193,17 +193,25 @@ async def render_test(
 @app.post("/generate-document")  # alias — matches the Airtable Automation's webhook URL
 async def generate(payload: dict, background_tasks: BackgroundTasks):
     """
-    Airtable-triggered generation, fired by the "Сгенерировать документ"
-    checkbox on Inquiries. Returns 202 immediately because LibreOffice
-    conversion + the Yandex Disk upload take longer than Airtable's webhook
-    timeout — generate_document_for_record() writes its own result (link,
-    status, error) back to the Inquiry record regardless of this response.
+    Airtable-triggered generation, fired by a generation checkbox on
+    Inquiries or (Договор поставки onward) Clients. Returns 202 immediately
+    because LibreOffice conversion + the Yandex Disk upload take longer
+    than Airtable's webhook timeout — generate_document_for_record()
+    writes its own result (link, status, error) back to the record
+    regardless of this response.
 
-    doc_type is accepted for backward compatibility with the original Stage
-    1 stub, but is no longer required: the template to use is read from the
-    Inquiry's own "Шаблон для генерации" link field, per the data-driven
-    Doc Templates / Doc Field Map design — adding a new template means
-    adding Airtable rows, not changing what this endpoint expects.
+    payload:
+      record_id      required. The triggering record.
+      table_id       optional. Defaults to Inquiries for backward
+                     compatibility with the original automation, which
+                     only ever sends record_id. Any other scope table
+                     (e.g. Clients) must send this explicitly.
+      template_name  optional. Only needed for scope tables that don't
+                     have their own "Шаблон для генерации" link field —
+                     Inquiries resolves its template from that link as
+                     before; Clients doesn't have one yet (single-purpose
+                     trigger, Договор поставки only), so its automation
+                     sends template_name directly instead.
     """
     from generate_and_deliver import generate_document_for_record
 
@@ -211,8 +219,14 @@ async def generate(payload: dict, background_tasks: BackgroundTasks):
     if not record_id:
         raise HTTPException(400, "record_id is required")
 
-    log.info("Generate requested for %s", record_id)
-    background_tasks.add_task(generate_document_for_record, record_id)
+    log.info("Generate requested for %s (table=%s, template=%s)",
+              record_id, payload.get("table_id"), payload.get("template_name"))
+    background_tasks.add_task(
+        generate_document_for_record,
+        record_id,
+        table_id=payload.get("table_id"),
+        template_name=payload.get("template_name"),
+    )
 
     return JSONResponse(
         status_code=202,
