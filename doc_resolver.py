@@ -225,6 +225,20 @@ def _line_sum(product_row):
     return 0
 
 
+def _line_discount(product_row):
+    # Mirrors _line_sum above, but for the per-line discount amount
+    # (product.discount_amount -> "discount_amount" after the "product."
+    # strip in the row loop) so discount_total can sum it the same way
+    # total_raw sums product.sum.
+    for k, v in product_row.items():
+        if k.endswith(".discount_amount") or k == "discount_amount":
+            try:
+                return float(v or 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
 def _rule_vat_inclusive_tax_value(ctx):
     total = ctx.get("total_raw", 0) or 0
     rate = 0
@@ -278,6 +292,12 @@ def _rule_today_date_full(ctx):
 
 COMPUTED_REGISTRY = {
     "sum_line_items": lambda ctx: round(sum(_line_sum(p) for p in ctx["products"]), 2),
+    # New: sums product.discount_amount (Сумма скидки) across items for the
+    # KP's total-discount summary row. Same shape as sum_line_items -- kept
+    # separate rather than parameterizing one function, since the two keys
+    # ("sum" vs "discount_amount") are genuinely different fields with
+    # nothing to gain from sharing an implementation.
+    "sum_discount_items": lambda ctx: round(sum(_line_discount(p) for p in ctx["products"]), 2),
     "vat_inclusive_tax_value": _rule_vat_inclusive_tax_value,
     "number_to_words_ru": _rule_number_to_words_ru,
     # BUG FIX: these three were selectable in Doc Field Map's Computed Rule
