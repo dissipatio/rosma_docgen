@@ -55,6 +55,7 @@ are set, e.g. via Railway shared vars):
 """
 
 import os
+import re
 import sys
 import argparse
 import traceback
@@ -70,6 +71,28 @@ CLIENTS_TABLE = "tblRRW1btCVX9Yp8F"
 DOC_TEMPLATES_TABLE = resolver.DOC_TEMPLATES_TABLE
 
 FLD_TPL_NAME = resolver.FLD_TPL_NAME  # "fld0w9V0nvHNMDros" -- primary field, Template name
+
+# Field IDs used only to build a human-readable filename (inquiry number /
+# client display name) -- not part of the render context.
+FLD_INQ_DISPLAY_NUMBER = "fldF1GTqeq8BiArqe"  # Inquiries: Inquiry (e.g. "B-1299")
+FLD_CLIENT_DISPLAY_NAME = "fldrMb8nojLXI7daC"  # Clients: Сокращённое наименование
+
+OUR_COMPANY_NAME = "РОСМА"  # used in generated filenames, e.g. "B-1299_РОСМА.pdf"
+
+
+def _display_id_for_filename(table_id, record, record_id):
+    """Best-effort human-readable identifier for the generated filename --
+    the Inquiry's own display number (e.g. "B-1299") for Inquiries-scoped
+    templates, the client's short name for Clients-scoped ones (Договор
+    поставки), falling back to the raw record_id if the expected field
+    isn't populated."""
+    if table_id == INQUIRIES_TABLE:
+        value = resolver._field(record, FLD_INQ_DISPLAY_NUMBER)
+    elif table_id == CLIENTS_TABLE:
+        value = resolver._field(record, FLD_CLIENT_DISPLAY_NAME)
+    else:
+        value = None
+    return str(value).strip() if value else record_id
 
 # Per-table trigger/result/status/error fields, and (Inquiries only) the
 # generic "which template" link field. Clients has no such link yet since
@@ -159,13 +182,20 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
         docx_path, pdf_path = doc_render.render_document(template_name, record_id, make_pdf=True)
 
         yd.ensure_folder_exists()
-        # NOTE: local docx/pdf filenames keep the readable "B-522 — КП Китай.pdf"
-        # form (see doc_render.py) -- that's fine locally. But Yandex Disk's
-        # API mishandled that same filename in a path parameter: spaces got
-        # encoded as '+', which is only valid in form bodies, not URL paths,
-        # and Yandex's server returned a 500 rather than a clean error. Keep
-        # the remote name plain ASCII to sidestep this entirely.
-        remote_filename = f"{record_id}.pdf"
+        # Filename now carries the inquiry number (or client name for
+        # Clients-scoped templates) plus the company name, e.g.
+        # "B-1299_РОСМА.pdf", instead of the bare record ID -- readable to
+        # whoever downloads it from the Yandex Disk link or the Airtable
+        # attachment copy. Kept space-free: Yandex Disk's upload API
+        # mishandles spaces in the `path` query param (requests encodes
+        # them as '+', form-style, which is only valid in form bodies, not
+        # URL paths, and Yandex's server returns a 500 rather than a clean
+        # error) -- any spaces already present in the source field (there
+        # shouldn't be any in an inquiry number, but a client name could
+        # have them) are collapsed to '-' rather than risk that.
+        display_id = _display_id_for_filename(table_id, record, record_id)
+        safe_display_id = re.sub(r"\s+", "-", display_id)
+        remote_filename = f"{safe_display_id}_{OUR_COMPANY_NAME}.pdf"
         public_url = yd.upload_and_publish(pdf_path, remote_filename)
 
         fmap = TABLE_FIELD_MAP[table_id]

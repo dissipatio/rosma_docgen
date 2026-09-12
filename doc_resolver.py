@@ -374,6 +374,20 @@ def _blank_none(obj):
 
 
 def build_context(template_name, root_ref):
+    # BUG FIX: _cached_record uses @lru_cache(maxsize=None) -- unbounded and
+    # never expires for the life of the process. On a long-running Railway
+    # service that means every record fetch is cached FOREVER: once any
+    # record involved in a render is fetched once, every later render of a
+    # document touching that same record reuses that stale snapshot
+    # indefinitely, even after the underlying Airtable data changes. This is
+    # what kept track_width resolving to nothing on A-1347 long after the
+    # Goods lookup itself was confirmed populated -- the Goods record had
+    # been cached before that data existed. Clearing at the start of every
+    # build_context() call keeps the (real) benefit of not re-fetching the
+    # same record twice within one document's render, while guaranteeing
+    # every new generation request starts from live Airtable data.
+    _cached_record.cache_clear()
+
     template = _load_template_record(template_name)
     rows = _load_field_map_rows(template["id"])
     root_table_id = _field(template, FLD_TPL_ROOT_TABLE_ID) or INQUIRIES_TABLE
