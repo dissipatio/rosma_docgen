@@ -65,7 +65,14 @@ def _resolve_image_fields(context, doc, output_dir):
     for jinja_var in image_fields:
         url = context.get(jinja_var)
         if not url:
-            context[jinja_var] = None
+            # BUG FIX: was `= None`. A bare {{ tag }} left as None prints the
+            # literal word "None" (Jinja only prints blank for a genuinely
+            # undefined variable, not an explicit None) -- "" is what
+            # actually renders as nothing. Same bug as the one fixed via
+            # _blank_none() in doc_resolver.py, just not yet hit here
+            # because no template has shipped without its stamp/signature
+            # attached.
+            context[jinja_var] = ""
             continue
         local_path = _download_to_temp(url, output_dir, jinja_var)
         context[jinja_var] = InlineImage(doc, local_path, width=Mm(IMAGE_WIDTH_MM))

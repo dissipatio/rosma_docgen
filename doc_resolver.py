@@ -43,6 +43,7 @@ import os
 import sys
 import json
 import argparse
+from datetime import date
 from functools import lru_cache
 
 import requests
@@ -253,10 +254,42 @@ def _rule_number_to_words_ru(ctx):
     return f"{words} {currency_word}"
 
 
+_RU_MONTHS_GENITIVE = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+
+def _rule_today_date_ru(ctx):
+    """DD.MM.YYYY -- matches the '~d.m.y' format hint on {DocumentCreateTime~d.m.y}."""
+    return date.today().strftime("%d.%m.%Y")
+
+
+def _rule_today_date_ru_long(ctx):
+    """'10 августа 2026' -- day, genitive month name, year."""
+    today = date.today()
+    return f"{today.day} {_RU_MONTHS_GENITIVE[today.month - 1]} {today.year}"
+
+
+def _rule_today_date_full(ctx):
+    """Same as today_date_ru_long with a trailing 'г.'"""
+    return f"{_rule_today_date_ru_long(ctx)} г."
+
+
 COMPUTED_REGISTRY = {
     "sum_line_items": lambda ctx: round(sum(_line_sum(p) for p in ctx["products"]), 2),
     "vat_inclusive_tax_value": _rule_vat_inclusive_tax_value,
     "number_to_words_ru": _rule_number_to_words_ru,
+    # BUG FIX: these three were selectable in Doc Field Map's Computed Rule
+    # field but had no implementation here. COMPUTED_REGISTRY.get(rule_name)
+    # returned None for them, which build_context() then wrote straight into
+    # context[jinja_var] as a literal None -- and Jinja/docxtpl prints an
+    # explicit None as the four-letter word "None", not blank. This is what
+    # produced "Коммерческое предложение № B-1299 от None" in the КП матрицы
+    # и ролики template (document_date -> today_date_ru).
+    "today_date_ru": _rule_today_date_ru,
+    "today_date_ru_long": _rule_today_date_ru_long,
+    "today_date_full": _rule_today_date_full,
     "row_index": None,  # handled inline in the row loop, not called generically
     "currency_symbol": None,  # in practice resolved as a Header lookup, not computed -- kept for schema completeness
 }
@@ -317,6 +350,29 @@ def _resolve_root_record(root_ref, root_table_id):
 # Main resolver
 # --------------------------------------------------------------------------
 
+def _blank_none(obj):
+    """Recursively replace Python None with '' throughout a context tree.
+
+    Jinja/docxtpl only prints an empty string for a genuinely *undefined*
+    variable -- an explicit None is str()'d, which prints the literal word
+    "None". This codebase uses None as "no data yet" all over the place
+    (skipped/Not-built placeholders, empty lookups, unmapped computed
+    rules, blank freeform text fields), so without this every one of those
+    cases showed up as visible "None" text in generated documents (the
+    date header, the general comment, and the payment/delivery terms
+    concatenation were the ones caught in practice). Leaves everything
+    else -- including 0, False, and InlineImage objects added later by
+    doc_render.py -- untouched.
+    """
+    if obj is None:
+        return ""
+    if isinstance(obj, dict):
+        return {k: _blank_none(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_blank_none(v) for v in obj]
+    return obj
+
+
 def build_context(template_name, root_ref):
     template = _load_template_record(template_name)
     rows = _load_field_map_rows(template["id"])
@@ -326,6 +382,15 @@ def build_context(template_name, root_ref):
     header_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Header"]
     image_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Image"]
     row_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Row"]
+    # BUG FIX: the alternate-field ("fldA|fldB") convention in _resolve_chain
+    # picks Die vs. Shell based on row_context["name"], which is only set
+    # once the product.name row has run for this item. Doc Field Map rows
+    # come back from Airtable in no particular order, so without this sort
+    # a track-width row (or any other alt-field row) processed before
+    # product.name always sees an empty name and silently falls back to the
+    # Die option -- observed as track width resolving to None for both a
+    # die AND a roller-shell line on the same inquiry.
+    row_rows.sort(key=lambda r: 0 if _field(r, FLD_MAP_JINJA_VAR) == "product.name" else 1)
     computed_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Computed"]
     static_rows = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) == "Static constant"]
     skipped = [r for r in rows if _select_name(_field(r, FLD_MAP_SCOPE)) in ("Not built", "")]
@@ -371,8 +436,17 @@ def build_context(template_name, root_ref):
             value = _resolve_chain(item_record, chain, row_context=row_ctx)
             if isinstance(value, dict):
                 value = _select_name(value)
-            elif isinstance(value, list) and value and isinstance(value[0], dict):
-                value = ", ".join(_multiselect_names(value))
+            elif isinstance(value, list) and value:
+                if isinstance(value[0], dict):
+                    value = ", ".join(_multiselect_names(value))
+                else:
+                    # BUG FIX: a multi-hop lookup through a linked-record
+                    # field (e.g. Inquired Items -> Goods -> material) comes
+                    # back as a list even when it resolves to a single
+                    # value. str()'ing that list literally printed
+                    # "['X46Cr13']" in rendered documents -- flatten it here
+                    # instead, same as the list-of-dicts case above.
+                    value = ", ".join(str(v) for v in value)
             row_ctx[jinja_var.replace("product.", "")] = value
         row_ctx["index"] = idx + 1
         products.append(row_ctx)
@@ -389,23 +463,36 @@ def build_context(template_name, root_ref):
         else:
             context[jinja_var] = None  # not yet defined -- add to STATIC_VALUES above
 
-    # --- Computed fields (may depend on header/products already in context) ---
-    for row in computed_rows:
-        jinja_var = _field(row, FLD_MAP_JINJA_VAR)
-        rule_name = _select_name(_field(row, FLD_MAP_COMPUTED_RULE))
-        if jinja_var == "product.index":
-            continue  # handled in the row loop above
-        rule_fn = COMPUTED_REGISTRY.get(rule_name)
-        if rule_fn is None:
-            context[jinja_var] = None
-            continue
-        context[jinja_var] = rule_fn(context)
+    # --- Computed fields (may depend on header/products, AND on each other:
+    # e.g. vat_inclusive_tax_value reads ctx["total_raw"], which is itself
+    # only present once sum_line_items has run). Doc Field Map rows come
+    # back from the Airtable API in no particular order, so a single pass
+    # can silently compute a dependent value before its dependency exists --
+    # ctx.get("total_raw", 0) then defaults to 0 with no error, which is
+    # exactly what produced "НДС 22%%: 0.0" on an order whose real VAT was
+    # $868.46. BUG FIX: run two passes; the first lets same-scope
+    # dependencies land in context, the second recomputes everything now
+    # that they're available. Cheap, and correct for any dependency depth
+    # the current registry actually has. ---
+    for _pass in range(2):
+        for row in computed_rows:
+            jinja_var = _field(row, FLD_MAP_JINJA_VAR)
+            rule_name = _select_name(_field(row, FLD_MAP_COMPUTED_RULE))
+            if jinja_var == "product.index":
+                continue  # handled in the row loop above
+            rule_fn = COMPUTED_REGISTRY.get(rule_name)
+            if rule_fn is None:
+                context[jinja_var] = None
+                continue
+            context[jinja_var] = rule_fn(context)
 
-    context["_meta"] = {
+    meta = {
         "template": template_name,
         "skipped_placeholders": [_field(r, FLD_MAP_PLACEHOLDER) for r in skipped],
         "image_fields": image_fields,
     }
+    context = _blank_none(context)
+    context["_meta"] = meta
     return context
 
 
