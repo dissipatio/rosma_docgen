@@ -327,7 +327,18 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
         # shouldn't undo the successful generation above, so it's caught
         # and swallowed rather than turning the whole run into an "Ошибка".
         log_inquiry_id = _inquiry_id_for_log(table_id, record, record_id)
-        if log_inquiry_id:
+        if not log_inquiry_id:
+            # Most likely a Договор поставки generation for a Client with
+            # no linked Inquiry (see _inquiry_id_for_log) -- nothing to
+            # hang an Updates row off of. Printed for the same reason as
+            # the except block below: silent skips are indistinguishable
+            # from bugs otherwise.
+            print(
+                f"[generate_and_deliver] No Inquiry to log an Updates row against for "
+                f"{record_id} (table {table_id}) -- skipped.",
+                file=sys.stderr,
+            )
+        else:
             try:
                 docx_remote_filename = f"{safe_display_id}_{OUR_COMPANY_NAME}.docx"
                 docx_url = yd.upload_and_publish(docx_path, docx_remote_filename)
