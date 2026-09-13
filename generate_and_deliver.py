@@ -57,6 +57,7 @@ are set, e.g. via Railway shared vars):
 import os
 import re
 import sys
+import time
 import argparse
 import traceback
 from datetime import datetime, timezone
@@ -180,17 +181,33 @@ TABLE_FIELD_MAP = {
 }
 
 
+def _airtable_request(method, url, **kwargs):
+    """Shared by _update_record/_create_record. Airtable rate-limits at 5
+    req/sec per base; build_context() alone does many reads in a tight
+    burst, and this module's own calls land right after that burst, so a
+    429 here is plausible under load even though each individual call is
+    normally fine. One short retry covers the ordinary transient case
+    (Airtable's own guidance is to back off ~30s, but that's unreasonable
+    to block a webhook response on, so this is a courtesy retry, not a
+    complete rate-limit strategy)."""
+    resp = requests.request(method, url, **kwargs)
+    if resp.status_code == 429:
+        time.sleep(3)
+        resp = requests.request(method, url, **kwargs)
+    return resp
+
+
 def _update_record(table_id, record_id, fields):
     url = f"{resolver.API_BASE}/{resolver.BASE_ID}/{table_id}/{record_id}"
-    r = requests.patch(url, headers=resolver.HEADERS, json={"fields": fields}, timeout=30)
+    r = _airtable_request("PATCH", url, headers=resolver.HEADERS, json={"fields": fields}, timeout=30)
     r.raise_for_status()
     return r.json()
 
 
 def _create_record(table_id, fields):
     url = f"{resolver.API_BASE}/{resolver.BASE_ID}/{table_id}"
-    r = requests.post(
-        url, headers=resolver.HEADERS, json={"fields": fields, "typecast": True}, timeout=30
+    r = _airtable_request(
+        "POST", url, headers=resolver.HEADERS, json={"fields": fields, "typecast": True}, timeout=30
     )
     r.raise_for_status()
     return r.json()
@@ -317,7 +334,21 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
                 type_value = _update_type_for_template(template_name)
                 _log_update_for_generation(log_inquiry_id, type_value, public_url, docx_url)
             except Exception:
-                pass
+                # Best-effort: a failure here shouldn't undo the successful
+                # generation above (status stays "Готово", the PDF link is
+                # already written). But it must NOT disappear silently --
+                # printed here (Railway captures stdout/stderr in its logs)
+                # so a missing Updates row is debuggable instead of a
+                # mystery. An earlier version of this block used a bare
+                # `except: pass`, which is exactly how a real failure here
+                # (e.g. the DOCX upload, or the create_record call itself)
+                # went completely unreported.
+                print(
+                    f"[generate_and_deliver] Updates-row logging failed for {record_id} "
+                    f"(document itself still generated successfully):",
+                    file=sys.stderr,
+                )
+                traceback.print_exc()
 
         return {"ok": True, "record_id": record_id, "url": public_url}
 
