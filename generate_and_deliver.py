@@ -340,6 +340,15 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
             )
         else:
             try:
+                # A short deliberate pause before starting the second
+                # upload to the same Yandex Disk folder -- confirmed in
+                # practice that starting it immediately after the PDF
+                # upload/publish just completed reliably 423-locks (see
+                # _RETRY_DELAYS_SECONDS in yandex_disk_upload.py for the
+                # full story). That retry budget alone covers this too,
+                # eventually, but avoiding the lock is cheaper than
+                # retrying through it every single time.
+                time.sleep(3)
                 docx_remote_filename = f"{safe_display_id}_{OUR_COMPANY_NAME}.docx"
                 docx_url = yd.upload_and_publish(docx_path, docx_remote_filename)
                 type_value = _update_type_for_template(template_name)

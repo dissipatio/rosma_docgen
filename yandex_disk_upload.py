@@ -26,12 +26,17 @@ DISK_API = "https://cloud-api.yandex.net/v1/disk/resources"
 
 # Yandex Disk returns 423 LOCKED when an async operation (publish, move,
 # delete) is still finishing on the same path -- this is a transient
-# collision, not a real conflict, and normally clears within a couple of
-# seconds. It got more likely to show up once a generation run started
-# uploading two files (PDF + DOCX) through the same folder instead of one,
-# and gets worse still if multiple records generate back-to-back. Retried
-# here rather than left to fail the whole run.
-_RETRY_DELAYS_SECONDS = [1, 2, 4, 8]
+# collision, not a real conflict. In practice this clears within tens of
+# seconds, not the couple of seconds originally assumed here: a real-world
+# trace showed a DOCX upload 423-locked for the full length of the
+# previous (much shorter) retry budget, immediately after the PDF upload
+# to the same folder had just completed -- consistent with Yandex holding
+# a brief folder-level lock while it settles a just-finished write, not
+# with anything actually wrong. /generate responds to its caller
+# immediately (202 Accepted) and does the real work afterward, so there's
+# no live request being held open here -- affording a much longer budget
+# than would be reasonable to block on.
+_RETRY_DELAYS_SECONDS = [2, 4, 8, 15, 30]
 
 
 def _headers():
