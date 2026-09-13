@@ -78,6 +78,15 @@ FLD_MAP_STATUS = "fldDGSCvew021kVBo"
 # Inquiries field IDs needed to find the row source
 FLD_INQ_ITEMS_LINK = "fldYy6SrZebO9mrQZ"
 
+# Inquiries checkbox: "Без печати и подписи" -- when checked, forces stamp
+# and signature blank in the rendered document regardless of whether the
+# Our company attachment fields actually have images uploaded. Only
+# meaningful when the template's root table is Inquiries (true for both
+# Spec templates); on other scope tables (e.g. Договор поставки -> Clients)
+# the root record simply won't have this field, so _field()'s default
+# leaves the checkbox treated as unchecked -- safe no-op there.
+FLD_INQ_NO_STAMP_SIGN = "fldDDtAJvvo1uk94A"
+
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY", "").strip()
 if not AIRTABLE_API_KEY:
     raise RuntimeError("AIRTABLE_API_KEY is not set")
@@ -456,6 +465,19 @@ def build_context(template_name, root_ref):
         context[jinja_var] = attachments[0]["url"] if attachments else None
         image_fields.append(jinja_var)
 
+    # BUG FIX / FEATURE: "Без печати и подписи" on Inquiries lets a user
+    # force a document out without stamp/signature (e.g. a draft sent for
+    # review before it's actually signed) even when Our company's
+    # Печать/Подпись attachments are populated. Overriding the URL to None
+    # here -- rather than touching doc_render.py -- reuses the existing
+    # "no attachment yet" path: _resolve_image_fields() already turns a
+    # None image value into "" so the {{ signature }}{{ stamp }} tags
+    # render blank instead of erroring or printing "None".
+    no_stamp_sign = bool(_field(root_record, FLD_INQ_NO_STAMP_SIGN, False))
+    if no_stamp_sign:
+        for jinja_var in image_fields:
+            context[jinja_var] = None
+
     # --- Row fields ---
     item_ids = _field(root_record, FLD_INQ_ITEMS_LINK, [])
     products = []
@@ -524,6 +546,7 @@ def build_context(template_name, root_ref):
         "template": template_name,
         "skipped_placeholders": [_field(r, FLD_MAP_PLACEHOLDER) for r in skipped],
         "image_fields": image_fields,
+        "stamp_signature_suppressed": no_stamp_sign,
     }
     context = _blank_none(context)
     context["_meta"] = meta
