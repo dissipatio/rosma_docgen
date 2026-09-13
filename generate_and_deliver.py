@@ -59,6 +59,7 @@ import re
 import sys
 import argparse
 import traceback
+from datetime import datetime, timezone
 
 import requests
 
@@ -69,6 +70,66 @@ import yandex_disk_upload as yd
 INQUIRIES_TABLE = resolver.INQUIRIES_TABLE
 CLIENTS_TABLE = "tblRRW1btCVX9Yp8F"
 DOC_TEMPLATES_TABLE = resolver.DOC_TEMPLATES_TABLE
+UPDATES_TABLE = "tblAGP1eIx6Oyomq1"
+
+# Updates fields used when logging a КП generation (see
+# _log_update_for_kp_generation below). Only fired for Inquiries-scoped КП
+# templates -- Clients-scoped ones (Договор поставки) have no "Inquiries
+# linked to update" to hang the record off of, and non-КП Inquiries
+# templates (Спецификация, Счёт) weren't asked for.
+FLD_UPD_INQUIRY_LINK = "fldodg80PN8iAOOkg"  # Inquiries linked to update
+FLD_UPD_TYPE = "fld419nHW9PB6KsFX"          # Types update (singleSelect, "КП" is an existing option)
+FLD_UPD_PDF_LINK = "fldI7K46hOWKZCWyE"      # PDF link (url)
+FLD_UPD_DOCX_LINK = "fldKL25uKySSXPluE"     # DOCX link (url)
+FLD_UPD_DATE_GMAIL = "fldrEqou0hQGy4zIT"    # Date_gmail (dateTime) -- reused here as "when this
+                                             # was created", same field the Gmail sync writes to,
+                                             # so both sources sort/display consistently.
+
+# Clients: Inquiries link -- Договор поставки is Clients-scoped and has no
+# Inquiry of its own, but Updates only has an "Inquiries linked to update"
+# field (no Clients link), so for that one template we fall back to the
+# client's own first linked Inquiry. Same fallback already used elsewhere
+# for that template's "Our company" resolution (see its Doc Templates
+# notes) -- reasonable since one client's inquiries share one seller
+# entity, and here it's just "something to hang the log row on", not data
+# the document itself depends on.
+FLD_CLIENT_INQUIRIES_LINK = "fldLcWAcez8ztMN4H"
+
+# Doc Templates name -> Updates "Types update" value, by prefix (covers
+# every variant of each category, e.g. all the "Спец — ..." templates).
+# "Документ" is the fallback for anything that doesn't match, rather than
+# skipping the log entirely, in case a template is added later that isn't
+# any of these four. "Спецификация"/"Счёт"/"Договор" aren't pre-existing
+# options on the Types update select -- created via typecast the first
+# time one of these logs, same as "КП" already was.
+_UPDATE_TYPE_BY_PREFIX = [
+    ("КП", "КП"),
+    ("Спец", "Спецификация"),
+    ("Счёт", "Счёт"),
+    ("Договор", "Договор"),
+]
+
+
+def _update_type_for_template(template_name):
+    for prefix, type_value in _UPDATE_TYPE_BY_PREFIX:
+        if template_name.startswith(prefix):
+            return type_value
+    return "Документ"
+
+
+def _inquiry_id_for_log(table_id, record, record_id):
+    """The Inquiry record ID to link the Updates row to. Direct for
+    Inquiries-scoped generations; for Clients-scoped ones (Договор
+    поставки) falls back to the client's own first linked Inquiry, per
+    FLD_CLIENT_INQUIRIES_LINK above. Returns None if neither is available
+    -- the caller skips logging in that case rather than creating an
+    Updates row with nothing to link it to."""
+    if table_id == INQUIRIES_TABLE:
+        return record_id
+    if table_id == CLIENTS_TABLE:
+        links = resolver._field(record, FLD_CLIENT_INQUIRIES_LINK, [])
+        return links[0] if links else None
+    return None
 
 FLD_TPL_NAME = resolver.FLD_TPL_NAME  # "fld0w9V0nvHNMDros" -- primary field, Template name
 
@@ -124,6 +185,35 @@ def _update_record(table_id, record_id, fields):
     r = requests.patch(url, headers=resolver.HEADERS, json={"fields": fields}, timeout=30)
     r.raise_for_status()
     return r.json()
+
+
+def _create_record(table_id, fields):
+    url = f"{resolver.API_BASE}/{resolver.BASE_ID}/{table_id}"
+    r = requests.post(
+        url, headers=resolver.HEADERS, json={"fields": fields, "typecast": True}, timeout=30
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _log_update_for_generation(inquiry_record_id, type_value, pdf_url, docx_url):
+    """Creates one Updates row per generation run, so a document's history
+    shows up there the same way a manually-logged comment or an incoming
+    email would -- link to both the PDF and the editable DOCX, and a
+    timestamp in Date_gmail (the same field the Gmail sync writes to, not a
+    new one) so generated-doc rows sort/display consistently alongside
+    emails rather than needing their own separate "when" field."""
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    _create_record(
+        UPDATES_TABLE,
+        {
+            FLD_UPD_INQUIRY_LINK: [inquiry_record_id],
+            FLD_UPD_TYPE: type_value,
+            FLD_UPD_PDF_LINK: pdf_url,
+            FLD_UPD_DOCX_LINK: docx_url,
+            FLD_UPD_DATE_GMAIL: now_iso,
+        },
+    )
 
 
 def _set_status(table_id, record_id, status, error_text=None, reset_trigger=False):
@@ -211,6 +301,24 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
             # link field every table already gets.
             result_fields[fmap["result_attachment"]] = [{"url": public_url}]
         _update_record(table_id, record_id, result_fields)
+
+        # Log an Updates row for every document type (КП, Спецификация,
+        # Счёт, Договор поставки). Also uploads the DOCX itself (not just
+        # the PDF) so the Updates row can link to the editable version too.
+        # Skipped only if there's genuinely no Inquiry to hang the row off
+        # of (see _inquiry_id_for_log). Best-effort: a failure here
+        # shouldn't undo the successful generation above, so it's caught
+        # and swallowed rather than turning the whole run into an "Ошибка".
+        log_inquiry_id = _inquiry_id_for_log(table_id, record, record_id)
+        if log_inquiry_id:
+            try:
+                docx_remote_filename = f"{safe_display_id}_{OUR_COMPANY_NAME}.docx"
+                docx_url = yd.upload_and_publish(docx_path, docx_remote_filename)
+                type_value = _update_type_for_template(template_name)
+                _log_update_for_generation(log_inquiry_id, type_value, public_url, docx_url)
+            except Exception:
+                pass
+
         return {"ok": True, "record_id": record_id, "url": public_url}
 
     except Exception as exc:
