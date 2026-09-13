@@ -59,12 +59,27 @@ def _request_with_retry(method, url, **kwargs):
     return resp
 
 
-def upload_and_publish(local_path, remote_filename):
+def upload_and_publish(local_path, remote_filename, _fallback=False):
     """
     Uploads local_path to YANDEX_DISK_FOLDER/remote_filename, publishes it,
     and returns the public URL. Overwrites if a file with the same name
     already exists (so re-generating a document for the same inquiry
     replaces the old link rather than accumulating copies).
+
+    If the upload step is STILL 423 LOCKED after the full retry budget
+    above, that's no longer an ordinary transient collision -- in
+    practice, this means one specific resource is stuck (most likely left
+    over from an earlier interrupted attempt, from before this module had
+    the folder-check and retry logic it has now), and no amount of
+    retrying clears it; a real-world trace showed the exact same path
+    still 423-locked after 60+ seconds of retries across multiple separate
+    runs, while a different filename (the PDF, right next to it) uploaded
+    fine every time. Rather than let one permanently stuck path block this
+    file forever, falls back ONCE to a timestamp-suffixed filename so the
+    caller still gets a working link. The stuck original is left alone --
+    delete it by hand in the Yandex Disk web UI if you want the stable
+    filename back; a fresh path won't inherit whatever state it's stuck
+    in.
     """
     remote_path = f"{YANDEX_DISK_FOLDER.rstrip('/')}/{remote_filename}"
 
@@ -76,6 +91,10 @@ def upload_and_publish(local_path, remote_filename):
         params={"path": remote_path, "overwrite": "true"},
         timeout=30,
     )
+    if r.status_code == 423 and not _fallback:
+        name, ext = os.path.splitext(remote_filename)
+        fallback_filename = f"{name}_{int(time.time())}{ext}"
+        return upload_and_publish(local_path, fallback_filename, _fallback=True)
     r.raise_for_status()
     upload_url = r.json()["href"]
 
