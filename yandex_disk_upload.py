@@ -109,20 +109,35 @@ _folder_confirmed = False  # module-level cache -- see ensure_folder_exists()
 
 
 def ensure_folder_exists():
-    """Creates YANDEX_DISK_FOLDER if it doesn't already exist. Only actually
-    hits the network once per process (cached in _folder_confirmed) -- it
-    was previously called on every single generation, which is almost
-    always a wasted round-trip once the folder exists, and every extra hit
-    on the same path is one more chance to collide with an in-progress
-    publish/upload and get a 423 (see _request_with_retry above, which
-    still covers this if the cache is ever wrong -- e.g. a fresh process
-    that hasn't confirmed yet racing another that's mid-upload)."""
+    """Confirms YANDEX_DISK_FOLDER exists, creating it only if it genuinely
+    doesn't. Only actually hits the network once per process (cached in
+    _folder_confirmed).
+
+    Checks with a plain GET first rather than unconditionally PUT-creating.
+    A metadata GET is read-only and never locks the resource; PUT-create on
+    a path that already exists is what was actually triggering the
+    persistent 423s in practice -- it shows up when several generation
+    runs overlap and each tries to "create" the same already-existing
+    folder at the same moment. Since this folder has existed since the
+    very first successful generation, that create call was pure
+    contention with no upside; only take the PUT path (still through
+    _request_with_retry, as a safety net) when the GET actually comes back
+    404."""
     global _folder_confirmed
     if _folder_confirmed:
         return
-    r = _request_with_retry(
+
+    get_resp = _request_with_retry(
+        "GET", DISK_API, headers=_headers(), params={"path": YANDEX_DISK_FOLDER}, timeout=30
+    )
+    if get_resp.status_code == 200:
+        _folder_confirmed = True
+        return
+
+    # Not found (or some other non-200) -- actually try to create it.
+    put_resp = _request_with_retry(
         "PUT", DISK_API, headers=_headers(), params={"path": YANDEX_DISK_FOLDER}, timeout=30
     )
-    if r.status_code not in (201, 409):
-        r.raise_for_status()
+    if put_resp.status_code not in (201, 409):
+        put_resp.raise_for_status()
     _folder_confirmed = True
