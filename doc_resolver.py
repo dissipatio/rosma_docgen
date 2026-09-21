@@ -176,6 +176,23 @@ def _schema_index():
 # Chain walking
 # --------------------------------------------------------------------------
 
+def _unwrap_ai(value):
+    """AI text fields (type aiText) come back from the API as
+    {"state": "generated", "value": "...", "isStale": false} instead of a
+    plain string. Without this, a chain ending on an AI field reached the
+    Header loop as a dict, got treated like a single-select option, and
+    _select_name() returned "" -- the document silently rendered blank
+    (seen on contract_date -> Contracts.Дата договора прописью, A-test).
+    Only a "generated" value is usable; "empty"/"error"/"pending" become
+    None (-> "" via _blank_none). A lookup of an AI field arrives as a list
+    of these dicts, so lists are unwrapped element by element."""
+    if isinstance(value, dict) and "state" in value and "value" in value:
+        return value.get("value") if value.get("state") == "generated" else None
+    if isinstance(value, list) and value and isinstance(value[0], dict) and "state" in value[0]:
+        return [_unwrap_ai(v) for v in value]
+    return value
+
+
 def is_roller_row(product_name):
     name = str(product_name or "")
     return "Обечайка" in name or "Ролик" in name
@@ -202,7 +219,7 @@ def _resolve_chain(start_record, field_id_chain_str, row_context=None):
             field_id = opt_b if is_roller_row(product_name) else opt_a
 
         if is_last:
-            return _field(current_record, field_id)
+            return _unwrap_ai(_field(current_record, field_id))
 
         # Not last -> must be a link field; follow it
         links = _field(current_record, field_id, [])
@@ -322,6 +339,74 @@ COMPUTED_REGISTRY = {
     "row_index": None,  # handled inline in the row loop, not called generically
     "currency_symbol": None,  # in practice resolved as a Header lookup, not computed -- kept for schema completeness
 }
+
+
+# --------------------------------------------------------------------------
+# Money formatting (display only)
+# --------------------------------------------------------------------------
+# BUG FIX: computed totals were written into the document as raw Python
+# floats -- "20000.0" instead of "20 000,00" (seen on the A-test Спецификация).
+# Formatting runs as the LAST step of build_context(), after every computed
+# rule has finished: sum_line_items / vat_inclusive_tax_value /
+# number_to_words_ru all read these values as numbers, so formatting any
+# earlier would break them.
+#
+# Style: Russian convention -- non-breaking space between thousands (so a
+# number never wraps across lines), comma decimal, always 2 decimals.
+#
+# String values like "€ 3606.56" (the Inquiries «VAT from SUM €» formula,
+# which puts the symbol first) are parsed and rebuilt as "3 606,56 €" so the
+# VAT line matches the totals. Any other string is left untouched.
+#
+# Kill switch: set DOCGEN_FORMAT_MONEY=0 on Railway to restore the old raw
+# output without a redeploy (e.g. if a template turns out to do arithmetic
+# on one of these variables in Jinja).
+
+FORMAT_MONEY = os.environ.get("DOCGEN_FORMAT_MONEY", "1").strip() != "0"
+
+# Header-level variables that hold money amounts
+MONEY_HEADER_VARS = {"total_raw", "total_sum", "tax_value", "discount_total"}
+# Per-item keys (after the "product." prefix is stripped in the row loop)
+MONEY_ROW_KEYS = {"price", "sum", "discounted_price", "discount_amount"}
+
+_CURRENCY_SYMBOLS = "€$₽¥£"
+
+
+def _fmt_number(num):
+    """20000 -> '20 000,00' (NBSP as thousands separator)."""
+    s = f"{float(num):,.2f}"                     # '20,000.00'
+    return s.replace(",", "\u00a0").replace(".", ",")
+
+
+def _format_money(value):
+    if isinstance(value, bool) or value is None or value == "":
+        return value
+    if isinstance(value, (int, float)):
+        return _fmt_number(value)
+    if isinstance(value, str):
+        text = value.strip()
+        symbol = ""
+        if text and text[0] in _CURRENCY_SYMBOLS:
+            symbol, text = text[0], text[1:].strip()
+        elif text and text[-1] in _CURRENCY_SYMBOLS:
+            symbol, text = text[-1], text[:-1].strip()
+        try:
+            num = float(text.replace("\u00a0", "").replace(" ", "").replace(",", "."))
+        except ValueError:
+            return value                           # not a plain amount -- leave as is
+        formatted = _fmt_number(num)
+        return f"{formatted}\u00a0{symbol}" if symbol else formatted
+    return value
+
+
+def _apply_money_format(context):
+    for var in MONEY_HEADER_VARS:
+        if var in context:
+            context[var] = _format_money(context[var])
+    for product in context.get("products", []):
+        for key in MONEY_ROW_KEYS:
+            if key in product:
+                product[key] = _format_money(product[key])
 
 
 # --------------------------------------------------------------------------
@@ -447,7 +532,18 @@ def build_context(template_name, root_ref):
         if not jinja_var or not chain:
             continue
         value = _resolve_chain(root_record, chain)
-        context[jinja_var] = _select_name(value) if isinstance(value, dict) else value
+        if isinstance(value, dict):
+            value = _select_name(value)
+        elif isinstance(value, list):
+            # Same flattening the row loop already does: a lookup (or an
+            # unwrapped AI lookup) ending a Header chain arrives as a list and
+            # would otherwise print as "['X']" in the document. Attachment
+            # lists never get here -- they're Image scope, handled below.
+            value = ", ".join(
+                _select_name(v) if isinstance(v, dict) else str(v)
+                for v in value if v not in (None, "")
+            )
+        context[jinja_var] = value
 
     # --- Image fields ---
     # The chain resolves to an Airtable attachment field, i.e. a list of
@@ -548,6 +644,11 @@ def build_context(template_name, root_ref):
         "image_fields": image_fields,
         "stamp_signature_suppressed": no_stamp_sign,
     }
+    # Display formatting runs last -- every computed rule above needs these
+    # values as numbers. See "Money formatting" section.
+    if FORMAT_MONEY:
+        _apply_money_format(context)
+
     context = _blank_none(context)
     context["_meta"] = meta
     return context
