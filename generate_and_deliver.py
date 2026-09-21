@@ -60,7 +60,7 @@ import sys
 import time
 import argparse
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 
@@ -103,17 +103,27 @@ FLD_CLIENT_INQUIRIES_LINK = "fldLcWAcez8ztMN4H"
 # any of these four. "Спецификация"/"Счёт"/"Договор" aren't pre-existing
 # options on the Types update select -- created via typecast the first
 # time one of these logs, same as "КП" already was.
+# Prefixes are compared after normalizing ё -> е and lowercasing, so
+# «Счет гибкая оплата» (е) and «Счёт ...» (ё) both map to "Счёт".
+# BUG FIX: the old exact-prefix "Счёт" never matched the real Doc Templates
+# names «Счет гибкая оплата» / «Счет предоплата 100%» (spelled with е), so
+# every invoice was logged as the fallback type "Документ".
 _UPDATE_TYPE_BY_PREFIX = [
-    ("КП", "КП"),
-    ("Спец", "Спецификация"),
-    ("Счёт", "Счёт"),
-    ("Договор", "Договор"),
+    ("кп", "КП"),
+    ("спец", "Спецификация"),
+    ("счет", "Счёт"),
+    ("договор", "Договор"),
 ]
 
 
+def _normalize_name(name):
+    return str(name or "").strip().lower().replace("ё", "е")
+
+
 def _update_type_for_template(template_name):
+    normalized = _normalize_name(template_name)
     for prefix, type_value in _UPDATE_TYPE_BY_PREFIX:
-        if template_name.startswith(prefix):
+        if normalized.startswith(prefix):
             return type_value
     return "Документ"
 
@@ -302,7 +312,19 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
         # have them) are collapsed to '-' rather than risk that.
         display_id = _display_id_for_filename(table_id, record, record_id)
         safe_display_id = re.sub(r"\s+", "-", display_id)
-        remote_filename = f"{safe_display_id}_{OUR_COMPANY_NAME}.pdf"
+        # BUG FIX: the filename used to be only "<inquiry>_РОСМА.pdf", and
+        # uploads run with overwrite=true -- so КП, Спецификация and Счёт for
+        # the same inquiry all overwrote ONE file, and every older Updates
+        # row's PDF/DOCX link silently started opening the newest document.
+        # Now the name also carries the template and a Moscow-time stamp,
+        # e.g. "A-test_Счет-гибкая-оплата_РОСМА_20260921-1557.pdf", so each
+        # generation is its own file and each Updates row keeps pointing at
+        # the version it logged. Still space-free (see note above); anything
+        # that isn't a letter/digit/_/- (spaces, %, quotes) becomes "-".
+        safe_template = re.sub(r"[^\w-]+", "-", str(template_name)).strip("-")
+        stamp = datetime.now(timezone(timedelta(hours=3))).strftime("%Y%m%d-%H%M")
+        base_filename = f"{safe_display_id}_{safe_template}_{OUR_COMPANY_NAME}_{stamp}"
+        remote_filename = f"{base_filename}.pdf"
         public_url = yd.upload_and_publish(pdf_path, remote_filename)
 
         fmap = TABLE_FIELD_MAP[table_id]
@@ -349,7 +371,7 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
                 # eventually, but avoiding the lock is cheaper than
                 # retrying through it every single time.
                 time.sleep(3)
-                docx_remote_filename = f"{safe_display_id}_{OUR_COMPANY_NAME}.docx"
+                docx_remote_filename = f"{base_filename}.docx"
                 docx_url = yd.upload_and_publish(docx_path, docx_remote_filename)
                 type_value = _update_type_for_template(template_name)
                 _log_update_for_generation(log_inquiry_id, type_value, public_url, docx_url)
