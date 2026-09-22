@@ -39,15 +39,56 @@ FLD_TPL_TEMPLATE_FILE = "flduRSPDOi4D8KHgR"  # "Template file" attachment field,
 IMAGE_WIDTH_MM = 30
 
 
+# Magic-byte signatures for the image formats Word can embed.
+_IMAGE_SIGNATURES = [
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpg"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+    (b"BM", "bmp"),
+    (b"II*\x00", "tiff"),
+    (b"MM\x00*", "tiff"),
+]
+_CONTENT_TYPE_EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/gif": "gif",
+    "image/bmp": "bmp",
+    "image/tiff": "tiff",
+}
+
+
+def _image_extension(content, content_type):
+    """Works out a real file extension for a downloaded image: magic bytes
+    first (they can't lie), then the HTTP Content-Type, else "png"."""
+    for signature, ext in _IMAGE_SIGNATURES:
+        if content.startswith(signature):
+            return ext
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    return _CONTENT_TYPE_EXT.get(ctype, "png")
+
+
 def _download_to_temp(url, output_dir, suffix):
     """Downloads an arbitrary URL (e.g. a stamp/signature attachment) to a
     temp file in output_dir. Returns the local path, or None if url is
-    falsy (e.g. no attachment uploaded yet for this field)."""
+    falsy (e.g. no attachment uploaded yet for this field).
+
+    BUG FIX: the temp file used to be saved as "_image_<var>" with NO
+    extension. python-docx takes the embedded part's extension from the
+    file name, so every stamp/signature went into the DOCX as
+    "word/media/image1." with no matching [Content_Types].xml entry.
+    LibreOffice (and therefore the PDFs) silently tolerated it, but
+    Microsoft Word reports "unreadable content" and, on repair, drops all
+    the images. Affected every template with Image-scope fields
+    (Спецификация, Счёт, Договор). The file now gets a real extension
+    (.png / .jpg / ...) detected from the bytes."""
     if not url:
         return None
     r = requests.get(url, timeout=60)
     r.raise_for_status()
-    path = os.path.join(output_dir, f"_image_{suffix}")
+    ext = _image_extension(r.content, r.headers.get("Content-Type"))
+    path = os.path.join(output_dir, f"_image_{suffix}.{ext}")
     with open(path, "wb") as f:
         f.write(r.content)
     return path
