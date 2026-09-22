@@ -25,6 +25,10 @@ import requests
 
 from docxtpl import DocxTemplate, InlineImage
 from docx.shared import Mm
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from jinja2 import Environment
+from lxml import etree
 
 from pdf_convert import docx_to_pdf  # shared with main.py -- same LibreOffice call, same profile-isolation fix
 import doc_resolver as resolver  # reuses BASE_ID, API_BASE, HEADERS, etc.
@@ -119,6 +123,130 @@ def _resolve_image_fields(context, doc, output_dir):
         context[jinja_var] = InlineImage(doc, local_path, width=Mm(IMAGE_WIDTH_MM))
 
 
+# ---------------------------------------------------------------------------
+# Image layout filters for templates
+# ---------------------------------------------------------------------------
+# Image-scope fields arrive in the context as InlineImage objects (30 mm wide,
+# inline -- see _resolve_image_fields). A plain {{ stamp }} keeps rendering
+# exactly like that, so existing templates are unaffected. A template can
+# instead choose the layout itself with one of two filters:
+#
+#   {{ signature|img(h=15) }}
+#       Inline image with an explicit size in mm: h= (height) or w= (width);
+#       the other dimension keeps the aspect ratio. Use h= for signatures:
+#       their proportions vary a lot, and a fixed width made a square-ish
+#       signature ~31 mm tall.
+#
+#   {{ stamp|float_img(h=38, x=22, y=-18, rotate=-4, opacity=90) }}
+#       Floating ("in front of text") image anchored to the paragraph the tag
+#       sits in. x / y = offset in mm from that paragraph's column/cell left
+#       edge and top edge (negative y = upwards). Takes no layout space, so a
+#       stamp can overlap the signature and the name like on paper. Optional:
+#       rotate= degrees (clockwise), opacity= 0-100, behind=True to put the
+#       image behind the text instead.
+#
+# Both return "" when the field is empty (no attachment, or «Без печати и
+# подписи» ticked), so the tag simply disappears. Type the tag in Word
+# with plain ASCII quotes/minus: Word's autocorrect may turn "-18" into
+# an en dash, which Jinja will reject.
+
+_EMU_PER_MM = 36000
+
+
+class FloatingImage(InlineImage):
+    """InlineImage variant that emits a <wp:anchor> (floating, no text wrap)
+    instead of <wp:inline>. Built from python-docx's own inline picture, so
+    the image part, relationship and sizing logic are identical."""
+
+    _z_order = 251659264  # Word-style relativeHeight seed; incremented per image
+
+    def __init__(self, tpl, image_descriptor, width=None, height=None,
+                 x_mm=0, y_mm=0, rotate=0, opacity=100, behind=False):
+        super().__init__(tpl, image_descriptor, width=width, height=height)
+        self.x_mm, self.y_mm = float(x_mm), float(y_mm)
+        self.rotate, self.opacity, self.behind = float(rotate), float(opacity), bool(behind)
+
+    def _insert_image(self):
+        inline = self.tpl.current_rendering_part.new_pic_inline(
+            self.image_descriptor, self.width, self.height
+        )
+        FloatingImage._z_order += 1
+
+        anchor = OxmlElement("wp:anchor")
+        for k, v in (("distT", "0"), ("distB", "0"), ("distL", "0"), ("distR", "0"),
+                     ("simplePos", "0"), ("relativeHeight", str(FloatingImage._z_order)),
+                     ("behindDoc", "1" if self.behind else "0"), ("locked", "0"),
+                     ("layoutInCell", "1"), ("allowOverlap", "1")):
+            anchor.set(k, v)
+
+        simple = OxmlElement("wp:simplePos")
+        simple.set("x", "0")
+        simple.set("y", "0")
+        anchor.append(simple)
+        for tag, rel, mm in (("wp:positionH", "column", self.x_mm),
+                             ("wp:positionV", "paragraph", self.y_mm)):
+            pos = OxmlElement(tag)
+            pos.set("relativeFrom", rel)
+            off = OxmlElement("wp:posOffset")
+            off.text = str(int(round(mm * _EMU_PER_MM)))
+            pos.append(off)
+            anchor.append(pos)
+
+        anchor.append(inline.find(qn("wp:extent")))
+        eff = OxmlElement("wp:effectExtent")
+        for side in ("l", "t", "r", "b"):
+            eff.set(side, "0")
+        anchor.append(eff)
+        anchor.append(OxmlElement("wp:wrapNone"))
+        anchor.append(inline.find(qn("wp:docPr")))
+        anchor.append(inline.find(qn("wp:cNvGraphicFramePr")))
+        graphic = inline.find(qn("a:graphic"))
+        anchor.append(graphic)
+
+        if self.rotate:
+            xfrm = graphic.find(".//" + qn("a:xfrm"))
+            if xfrm is not None:
+                xfrm.set("rot", str(int(round(self.rotate * 60000))))
+        if self.opacity < 100:
+            blip = graphic.find(".//" + qn("a:blip"))
+            if blip is not None:
+                alpha = OxmlElement("a:alphaModFix")
+                alpha.set("amt", str(int(max(0, self.opacity) * 1000)))
+                blip.append(alpha)
+
+        return ("</w:t></w:r><w:r><w:drawing>%s</w:drawing></w:r><w:r>"
+                '<w:t xml:space="preserve">' % etree.tostring(anchor, encoding="unicode"))
+
+
+def _size_kwargs(h, w):
+    # Only one dimension is passed on, so python-docx keeps the aspect ratio.
+    if w:
+        return {"width": Mm(float(w)), "height": None}
+    if h:
+        return {"width": None, "height": Mm(float(h))}
+    return {"width": Mm(IMAGE_WIDTH_MM), "height": None}
+
+
+def _img_filter(value, h=None, w=None):
+    if not isinstance(value, InlineImage):
+        return value  # "" (no image) passes through as blank
+    return InlineImage(value.tpl, value.image_descriptor, **_size_kwargs(h, w))
+
+
+def _float_img_filter(value, h=None, w=None, x=0, y=0, rotate=0, opacity=100, behind=False):
+    if not isinstance(value, InlineImage):
+        return value
+    return FloatingImage(value.tpl, value.image_descriptor, x_mm=x, y_mm=y,
+                         rotate=rotate, opacity=opacity, behind=behind, **_size_kwargs(h, w))
+
+
+def _jinja_env():
+    env = Environment()  # same defaults docxtpl uses when no env is passed
+    env.filters["img"] = _img_filter
+    env.filters["float_img"] = _float_img_filter
+    return env
+
+
 def _get_template_file_url(template_record):
     """Doc Templates.Template file is an attachment field -- Airtable returns
     a list of attachment objects, each with a temporary 'url'. That URL
@@ -163,7 +291,7 @@ def render_document(template_name, inquiry_ref, output_dir=None, make_pdf=True):
 
     doc = DocxTemplate(template_local_path)
     _resolve_image_fields(context, doc, output_dir)
-    doc.render(context)
+    doc.render(context, _jinja_env())
 
     safe_inquiry = str(inquiry_ref).replace("/", "-")
     docx_filename = f"{safe_inquiry} — {template_name}.docx"
