@@ -65,6 +65,19 @@ FLD_TPL_ROOT_TABLE_ID = "fldCYFwoErMgqGyIO"
 FLD_TPL_HAS_ROW_LOOP = "fld34BUKorsCjkll0"
 FLD_TPL_ACTIVE = "fldYBt2YpHUqvM7o3"
 
+# Optional per-template ROW FILTER (both fields empty = no filtering, i.e. the
+# template behaves exactly as before). Lets a template render only the items
+# whose status is in an allowed list -- e.g. КП templates show only items
+# with «Статус КП для товара» = «Отправлено клиенту», so managers never have
+# to delete unsent items from the inquiry.
+#   FLD_TPL_ROW_FILTER_FIELD  -- text: the Field ID to check on each item
+#                                (a field on Inquired Items, e.g. fld37V1onwDwcUnyV)
+#   FLD_TPL_ROW_FILTER_VALUES -- long text: allowed values, ONE PER LINE
+# (Doc Templates fields «Row filter field ID» / «Row filter values». If either
+# constant is set to "" the filter is switched off for every template.)
+FLD_TPL_ROW_FILTER_FIELD = "fldzMkZhPAXjlAecT"
+FLD_TPL_ROW_FILTER_VALUES = "fld8gUUCxIH48rjDb"
+
 # Doc Field Map field IDs
 FLD_MAP_TEMPLATE_LINK = "fldCVYFb71sDiq9qZ"
 FLD_MAP_PLACEHOLDER = "fldD472VBzTAw6Ydz"
@@ -461,6 +474,41 @@ def _resolve_root_record(root_ref, root_table_id):
 
 
 # --------------------------------------------------------------------------
+# Row filter -- show only items whose status is in a template-defined list
+# --------------------------------------------------------------------------
+
+def _load_row_filter(template):
+    """Returns (field_id, {allowed values}) or None when the template has no
+    filter configured (either config field empty, or field IDs not set up)."""
+    if not FLD_TPL_ROW_FILTER_FIELD or not FLD_TPL_ROW_FILTER_VALUES:
+        return None
+    field_id = str(_field(template, FLD_TPL_ROW_FILTER_FIELD) or "").strip()
+    raw = str(_field(template, FLD_TPL_ROW_FILTER_VALUES) or "")
+    allowed = {line.strip() for line in raw.splitlines() if line.strip()}
+    if not field_id or not allowed:
+        return None
+    return field_id, allowed
+
+
+def _item_passes_filter(item_record, row_filter):
+    """True if the item should be rendered. An item whose filter field is
+    empty is NOT rendered when a filter is active (no status = not sent).
+    Comparison is whitespace-trimmed on both sides, because some option names
+    are stored with stray leading spaces (e.g. ' Спец (согласование)')."""
+    if row_filter is None:
+        return True
+    field_id, allowed = row_filter
+    value = _unwrap_ai(_field(item_record, field_id))
+    if isinstance(value, list):
+        names = [_select_name(v) if isinstance(v, dict) else str(v) for v in value]
+    elif value is None:
+        names = []
+    else:
+        names = [_select_name(value) if isinstance(value, dict) else str(value)]
+    return any(n.strip() in allowed for n in names)
+
+
+# --------------------------------------------------------------------------
 # Main resolver
 # --------------------------------------------------------------------------
 
@@ -576,9 +624,18 @@ def build_context(template_name, root_ref):
 
     # --- Row fields ---
     item_ids = _field(root_record, FLD_INQ_ITEMS_LINK, [])
+    # Optional per-template filter (see FLD_TPL_ROW_FILTER_*). Hidden items are
+    # skipped BEFORE anything is computed, so every total / VAT / discount sum /
+    # amount-in-words (all derived from context["products"]) automatically
+    # covers only the rendered items.
+    row_filter = _load_row_filter(template)
+    hidden_by_filter = 0
     products = []
-    for idx, item_id in enumerate(item_ids):
+    for item_id in item_ids:
         item_record = _cached_record(INQUIERED_ITEMS_TABLE, item_id)
+        if not _item_passes_filter(item_record, row_filter):
+            hidden_by_filter += 1
+            continue
         row_ctx = {}
         for row in row_rows:
             jinja_var = _field(row, FLD_MAP_JINJA_VAR)
@@ -600,8 +657,18 @@ def build_context(template_name, root_ref):
                     # instead, same as the list-of-dicts case above.
                     value = ", ".join(str(v) for v in value)
             row_ctx[jinja_var.replace("product.", "")] = value
-        row_ctx["index"] = idx + 1
+        # Numbered by position among the items actually shown (1, 2, 3...),
+        # not by position in the inquiry, so hidden items leave no gaps.
+        row_ctx["index"] = len(products) + 1
         products.append(row_ctx)
+    if row_filter is not None and item_ids and not products:
+        # Every item was filtered out. Fail loudly rather than producing an
+        # empty КП that could be sent to a client by mistake.
+        raise ValueError(
+            "No items to show in this document: none of the "
+            f"{len(item_ids)} item(s) has a status in the template's row "
+            f"filter ({', '.join(sorted(row_filter[1]))})"
+        )
     context["products"] = products
 
     # --- Static constants ---
@@ -643,6 +710,7 @@ def build_context(template_name, root_ref):
         "skipped_placeholders": [_field(r, FLD_MAP_PLACEHOLDER) for r in skipped],
         "image_fields": image_fields,
         "stamp_signature_suppressed": no_stamp_sign,
+        "rows_hidden_by_filter": hidden_by_filter,
     }
     # Display formatting runs last -- every computed rule above needs these
     # values as numbers. See "Money formatting" section.
