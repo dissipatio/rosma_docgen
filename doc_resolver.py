@@ -670,6 +670,14 @@ def build_context(template_name, root_ref):
             f"filter ({', '.join(sorted(row_filter[1]))})"
         )
     context["products"] = products
+    # One log line per render (visible in Railway logs) so it is obvious whether
+    # the row filter was active for this template and what it did.
+    print(
+        f"[docgen] row filter for '{template_name}': "
+        f"{'ON' if row_filter is not None else 'OFF'} -- "
+        f"showing {len(products)} of {len(item_ids)} item(s), hidden {hidden_by_filter}",
+        flush=True,
+    )
 
     # --- Static constants ---
     STATIC_VALUES = {
