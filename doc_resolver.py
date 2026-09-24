@@ -278,18 +278,63 @@ def _line_discount(product_row):
     return 0
 
 
+def _row_label(product_row):
+    """Short human label for error messages."""
+    return str(product_row.get("name") or f"строка {product_row.get('index', '?')}")
+
+
+def _row_vat_rate(product_row):
+    """The item's effective VAT rate as a number (22, 20, 0) from Inquired
+    Items «Ставка НДС» (item VAT, falling back to the inquiry's Vat), mapped
+    in Doc Field Map as product.vat_rate. None if missing."""
+    raw = product_row.get("vat_rate")
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(str(raw).replace("%", "").replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_rate(rate):
+    return f"{int(rate)}%" if float(rate).is_integer() else f"{rate:g}%"
+
+
+def _check_vat_rates(ctx):
+    missing = [_row_label(p) for p in ctx["products"] if _row_vat_rate(p) is None]
+    if missing:
+        raise ValueError(
+            "НДС не определён (пустая «Ставка НДС» -- заполните VAT у товара "
+            "или Vat у заявки): " + "; ".join(missing)
+        )
+
+
 def _rule_vat_inclusive_tax_value(ctx):
-    total = ctx.get("total_raw", 0) or 0
-    rate = 0
-    if ctx["products"]:
-        rate_raw = ctx["products"][0].get("tax_rate") or ctx["products"][0].get("product.tax_rate")
+    """Total VAT of the document = sum of Inquired Items «НДС в строке»
+    (product.vat) over the rows actually rendered. Each line's VAT is
+    computed in Airtable on the line's final amount (Sum КП со скидкой, so
+    discounts are included) at that item's own rate -- mixed rates, discounts
+    and the row filter are therefore all handled correctly.
+    Replaces the old single-rate formula (total - total/(1+rate)) that took
+    the rate from the first item only and printed 0 when it was missing."""
+    _check_vat_rates(ctx)
+    total = 0.0
+    for p in ctx["products"]:
+        v = p.get("vat")
         try:
-            rate = float(str(rate_raw).replace("%", "")) if rate_raw else 0
+            total += float(v or 0)
         except (TypeError, ValueError):
-            rate = 0
-    if not rate:
-        return 0.0
-    return round(total - total / (1 + rate / 100), 2)
+            raise ValueError(f"Некорректное значение «НДС в строке» у {_row_label(p)}: {v!r}")
+    return round(total, 2)
+
+
+def _rule_vat_rate_label(ctx):
+    """Header label for the rate: '22%' normally, '20% / 22%' if the rendered
+    items have different rates -- so the label can never contradict the
+    VAT amount."""
+    _check_vat_rates(ctx)
+    rates = sorted({_row_vat_rate(p) for p in ctx["products"]})
+    return " / ".join(_fmt_rate(r) for r in rates)
 
 
 def _rule_number_to_words_ru(ctx):
@@ -338,6 +383,7 @@ COMPUTED_REGISTRY = {
     # nothing to gain from sharing an implementation.
     "sum_discount_items": lambda ctx: round(sum(_line_discount(p) for p in ctx["products"]), 2),
     "vat_inclusive_tax_value": _rule_vat_inclusive_tax_value,
+    "vat_rate_label": _rule_vat_rate_label,
     "number_to_words_ru": _rule_number_to_words_ru,
     # BUG FIX: these three were selectable in Doc Field Map's Computed Rule
     # field but had no implementation here. COMPUTED_REGISTRY.get(rule_name)
@@ -380,7 +426,7 @@ FORMAT_MONEY = os.environ.get("DOCGEN_FORMAT_MONEY", "1").strip() != "0"
 # Header-level variables that hold money amounts
 MONEY_HEADER_VARS = {"total_raw", "total_sum", "tax_value", "discount_total"}
 # Per-item keys (after the "product." prefix is stripped in the row loop)
-MONEY_ROW_KEYS = {"price", "sum", "discounted_price", "discount_amount"}
+MONEY_ROW_KEYS = {"price", "sum", "discounted_price", "discount_amount", "vat"}
 
 _CURRENCY_SYMBOLS = "€$₽¥£"
 
@@ -657,6 +703,12 @@ def build_context(template_name, root_ref):
                     # instead, same as the list-of-dicts case above.
                     value = ", ".join(str(v) for v in value)
             row_ctx[jinja_var.replace("product.", "")] = value
+        # Per-row rate label ("22%") for templates that print the rate in a
+        # table column. Always derived from the same effective rate used for
+        # the VAT amount, so column, header label and VAT never disagree.
+        _rate = _row_vat_rate(row_ctx)
+        if _rate is not None:
+            row_ctx["tax_rate"] = _fmt_rate(_rate)
         # Numbered by position among the items actually shown (1, 2, 3...),
         # not by position in the inquiry, so hidden items leave no gaps.
         row_ctx["index"] = len(products) + 1
