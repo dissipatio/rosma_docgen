@@ -34,7 +34,9 @@ Field IDs (Clients, tblRRW1btCVX9Yp8F) -- same shape, Договор поста�
     fldNs6MbeHCSjGTO2  Ссылка на сгенерированный документ (url)
     fldUZfvt8hEAaGuhY  Статус генерации              (singleSelect)
     fld7bbN3bPaEDsaPO  Ошибка генерации              (multilineText)
-    fldD8D8H3gN7scBJx  Договор (файл)                (attachment, convenience
+    fldcxiKZRBvdohDGj  Ссылка на DOCX договора       (url, written with the PDF link)
+    fldD8D8H3gN7scBJx  Договор (файл)                (attachment -- NO LONGER written;
+                                                       kept for reference only. Was a convenience
                                                        copy -- populated by
                                                        pointing Airtable at
                                                        the same Yandex Disk
@@ -178,6 +180,7 @@ TABLE_FIELD_MAP = {
         "status": "fldxI9z9NHTjpwgDk",
         "error": "fldejocySzUZ7SVMa",
         "result_attachment": None,
+        "result_docx_link": None,
     },
     CLIENTS_TABLE: {
         "trigger": "fld6EZ04Ym74AKY2x",
@@ -186,7 +189,10 @@ TABLE_FIELD_MAP = {
         "result_link": "fldNs6MbeHCSjGTO2",
         "status": "fldUZfvt8hEAaGuhY",
         "error": "fld7bbN3bPaEDsaPO",
-        "result_attachment": "fldD8D8H3gN7scBJx",
+        # Договор (файл) attachment copy is no longer written -- Clients now
+        # gets exactly two result links: PDF (result_link) and DOCX below.
+        "result_attachment": None,
+        "result_docx_link": "fldcxiKZRBvdohDGj",  # Clients: Ссылка на DOCX договора
     },
 }
 
@@ -328,12 +334,21 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
         public_url = yd.upload_and_publish(pdf_path, remote_filename)
 
         fmap = TABLE_FIELD_MAP[table_id]
+        docx_url = None
+        if fmap.get("result_docx_link"):
+            # Clients-scoped documents get a DOCX link on the record itself.
+            # Short pause: back-to-back uploads to the same Yandex Disk
+            # folder reliably 423-lock (see yandex_disk_upload.py).
+            time.sleep(3)
+            docx_url = yd.upload_and_publish(docx_path, f"{base_filename}.docx")
         result_fields = {
             fmap["result_link"]: public_url,
             fmap["status"]: "Готово",
             fmap["error"]: "",
             fmap["trigger"]: False,
         }
+        if fmap.get("result_docx_link") and docx_url:
+            result_fields[fmap["result_docx_link"]] = docx_url
         if fmap.get("result_attachment"):
             # Airtable fetches and stores its own copy given a URL -- gives
             # a one-click download right on the record, on top of the plain
@@ -370,9 +385,10 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
                 # full story). That retry budget alone covers this too,
                 # eventually, but avoiding the lock is cheaper than
                 # retrying through it every single time.
-                time.sleep(3)
-                docx_remote_filename = f"{base_filename}.docx"
-                docx_url = yd.upload_and_publish(docx_path, docx_remote_filename)
+                if not docx_url:
+                    time.sleep(3)
+                    docx_remote_filename = f"{base_filename}.docx"
+                    docx_url = yd.upload_and_publish(docx_path, docx_remote_filename)
                 type_value = _update_type_for_template(template_name)
                 _log_update_for_generation(log_inquiry_id, type_value, public_url, docx_url)
             except Exception:
