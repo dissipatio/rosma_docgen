@@ -211,6 +211,43 @@ def is_roller_row(product_name):
     return "Обечайка" in name or "Ролик" in name
 
 
+# --------------------------------------------------------------------------
+# Multi-record links -- which linked record does a chain follow?
+#
+# A chain hop normally follows the FIRST linked record. That is fine for
+# one-to-one links (Inquiry -> Клиент из сделки) but wrong when a client has
+# several contracts: Airtable lists them in no meaningful order, so a repair
+# contract could end up in a sales document. When a hop enters the Contracts
+# table we therefore keep only «Продажа» contracts and take the newest by
+# date. Repair contracts live in another base and will get their own rule
+# when those templates are built.
+# --------------------------------------------------------------------------
+
+CONTRACTS_TABLE = "tblfU0LK1wAa7XQjW"
+FLD_CONTRACT_KIND = "fldhzFNrjX61No7Qn"   # single select: Продажа / Ремонт
+FLD_CONTRACT_DATE = "fldbsupcQZ84oxmfB"   # date (ISO string from the API)
+CONTRACT_KIND_SALE = "Продажа"
+
+
+def _pick_link(next_table_id, record_ids):
+    """Return the ID of the linked record a chain hop should follow."""
+    if next_table_id != CONTRACTS_TABLE:
+        return record_ids[0]
+    contracts = [_cached_record(CONTRACTS_TABLE, rid) for rid in record_ids]
+    sales = [
+        c for c in contracts
+        if _select_name(_field(c, FLD_CONTRACT_KIND)).strip() == CONTRACT_KIND_SALE
+    ]
+    if not sales:
+        raise ValueError(
+            "У клиента нет договора типа «Продажа» (найдено договоров другого "
+            f"типа: {len(contracts)})"
+        )
+    # Newest by date; a contract with no date sorts oldest. Ties keep the
+    # first one, so exact duplicate records give the same result either way.
+    return max(sales, key=lambda c: _field(c, FLD_CONTRACT_DATE) or "")["id"]
+
+
 def _resolve_chain(start_record, field_id_chain_str, row_context=None):
     """Walk a Field ID chain starting at an already-fetched record.
     Returns the raw field value at the end of the chain (caller normalizes
@@ -238,11 +275,11 @@ def _resolve_chain(start_record, field_id_chain_str, row_context=None):
         links = _field(current_record, field_id, [])
         if not links:
             return None
-        next_record_id = links[0]
         meta = schema.get(field_id)
         if not meta or not meta.get("linked_table_id"):
             raise ValueError(f"Field {field_id} is not a recognized link field in base schema")
         next_table_id = meta["linked_table_id"]
+        next_record_id = _pick_link(next_table_id, links)
         current_record = _cached_record(next_table_id, next_record_id)
 
     return None
