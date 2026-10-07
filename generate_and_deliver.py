@@ -373,6 +373,35 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
     stuck unable to retry.
     """
     table_id = _detect_table(record_id, table_id)
+
+    # Supplier-order tables: one table, two documents. If the webhook did not
+    # name a template, the ticked trigger checkbox(es) decide which document(s)
+    # to build, so ONE Airtable automation per table is enough (condition:
+    # either checkbox is checked; the script sends just record_id + table_id).
+    # Several ticked = generated one after another (Yandex Disk 423-locks
+    # back-to-back uploads, hence the pause).
+    if table_id in ORDER_TABLES and not template_name:
+        record = resolver._get_record(table_id, record_id)
+        ticked = [
+            name for name, cfg in TABLE_FIELD_MAP[table_id]["templates"].items()
+            if resolver._field(record, cfg["trigger"], False)
+        ]
+        if not ticked:
+            msg = "No trigger checkbox is ticked on this record -- nothing to generate."
+            try:
+                _set_status(table_id, record_id, "Ошибка", error_text=msg)
+            except Exception:
+                pass
+            return {"ok": False, "record_id": record_id, "error": msg}
+        results = []
+        for i, name in enumerate(ticked):
+            if i:
+                time.sleep(5)
+            results.append(generate_document_for_record(record_id, table_id=table_id, template_name=name))
+        return {"ok": all(r["ok"] for r in results), "record_id": record_id, "results": results,
+                "url": next((r.get("url") for r in results if r.get("url")), None),
+                "error": "; ".join(r["error"] for r in results if not r["ok"])}
+
     try:
         _set_status(table_id, record_id, "В процессе", error_text="", template_name=template_name)
 
