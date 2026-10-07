@@ -78,6 +78,15 @@ FLD_TPL_ACTIVE = "fldYBt2YpHUqvM7o3"
 FLD_TPL_ROW_FILTER_FIELD = "fldzMkZhPAXjlAecT"
 FLD_TPL_ROW_FILTER_VALUES = "fld8gUUCxIH48rjDb"
 
+# Optional per-template ROW LINK (Doc Templates «Row link field ID»): the field
+# ID of the link ON THE ROOT RECORD that lists the Inquired Items to render as
+# rows. Empty = FLD_INQ_ITEMS_LINK (Inquiries' items link), i.e. every
+# existing template behaves exactly as before. Supplier-order templates set
+# it: «orders GRAF, La Meccanica, Viteral» -> fldg8cEaYBC9ugClS ("inquiries
+# junction 2"), «orders CHINA and others» -> fldl1gyeWjQqOSnCO ("inquiries
+# junction").
+FLD_TPL_ROW_LINK = "flde8lMXxTlSrEToI"
+
 # Doc Field Map field IDs
 FLD_MAP_TEMPLATE_LINK = "fldCVYFb71sDiq9qZ"
 FLD_MAP_PLACEHOLDER = "fldD472VBzTAw6Ydz"
@@ -706,7 +715,8 @@ def build_context(template_name, root_ref):
             context[jinja_var] = None
 
     # --- Row fields ---
-    item_ids = _field(root_record, FLD_INQ_ITEMS_LINK, [])
+    row_link_field = str(_field(template, FLD_TPL_ROW_LINK) or "").strip() or FLD_INQ_ITEMS_LINK
+    item_ids = _field(root_record, row_link_field, [])
     # Optional per-template filter (see FLD_TPL_ROW_FILTER_*). Hidden items are
     # skipped BEFORE anything is computed, so every total / VAT / discount sum /
     # amount-in-words (all derived from context["products"]) automatically

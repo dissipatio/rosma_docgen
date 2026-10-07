@@ -1,0 +1,235 @@
+From e4f25809cea36218553000c91e9ee98f38009c01 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 12:08:39 +0300
+Subject: [PATCH] Support supplier-order templates (GRAF/CHINA): per-template
+ row link, order tables in delivery map
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Ls1VHCJWxSUe3NW9udNz8y
+---
+ doc_resolver.py         |  12 ++++-
+ generate_and_deliver.py | 103 ++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 106 insertions(+), 9 deletions(-)
+
+diff --git a/doc_resolver.py b/doc_resolver.py
+index 8954bef..6fa1082 100644
+--- a/doc_resolver.py
++++ b/doc_resolver.py
+@@ -78,6 +78,15 @@ FLD_TPL_ACTIVE = "fldYBt2YpHUqvM7o3"
+ FLD_TPL_ROW_FILTER_FIELD = "fldzMkZhPAXjlAecT"
+ FLD_TPL_ROW_FILTER_VALUES = "fld8gUUCxIH48rjDb"
+ 
++# Optional per-template ROW LINK (Doc Templates «Row link field ID»): the field
++# ID of the link ON THE ROOT RECORD that lists the Inquired Items to render as
++# rows. Empty = FLD_INQ_ITEMS_LINK (Inquiries' items link), i.e. every
++# existing template behaves exactly as before. Supplier-order templates set
++# it: «orders GRAF, La Meccanica, Viteral» -> fldg8cEaYBC9ugClS ("inquiries
++# junction 2"), «orders CHINA and others» -> fldl1gyeWjQqOSnCO ("inquiries
++# junction").
++FLD_TPL_ROW_LINK = "flde8lMXxTlSrEToI"
++
+ # Doc Field Map field IDs
+ FLD_MAP_TEMPLATE_LINK = "fldCVYFb71sDiq9qZ"
+ FLD_MAP_PLACEHOLDER = "fldD472VBzTAw6Ydz"
+@@ -706,7 +715,8 @@ def build_context(template_name, root_ref):
+             context[jinja_var] = None
+ 
+     # --- Row fields ---
+-    item_ids = _field(root_record, FLD_INQ_ITEMS_LINK, [])
++    row_link_field = str(_field(template, FLD_TPL_ROW_LINK) or "").strip() or FLD_INQ_ITEMS_LINK
++    item_ids = _field(root_record, row_link_field, [])
+     # Optional per-template filter (see FLD_TPL_ROW_FILTER_*). Hidden items are
+     # skipped BEFORE anything is computed, so every total / VAT / discount sum /
+     # amount-in-words (all derived from context["products"]) automatically
+diff --git a/generate_and_deliver.py b/generate_and_deliver.py
+index 23a324b..e0ae863 100644
+--- a/generate_and_deliver.py
++++ b/generate_and_deliver.py
+@@ -72,6 +72,10 @@ import yandex_disk_upload as yd
+ 
+ INQUIRIES_TABLE = resolver.INQUIRIES_TABLE
+ CLIENTS_TABLE = "tblRRW1btCVX9Yp8F"
++# Supplier-order tables (templates «Заказ GRAF/Китай с клиентами / без клиентов»)
++ORDERS_GRAF_TABLE = "tblA3sfaFgQz3yEFk"   # orders GRAF, La Meccanica, Viteral
++ORDERS_CHINA_TABLE = "tblvbHarBMdO9ys6S"  # orders CHINA and others
++ORDER_TABLES = (ORDERS_GRAF_TABLE, ORDERS_CHINA_TABLE)
+ DOC_TEMPLATES_TABLE = resolver.DOC_TEMPLATES_TABLE
+ UPDATES_TABLE = "tblAGP1eIx6Oyomq1"
+ 
+@@ -150,6 +154,8 @@ FLD_TPL_NAME = resolver.FLD_TPL_NAME  # "fld0w9V0nvHNMDros" -- primary field, Te
+ # client display name) -- not part of the render context.
+ FLD_INQ_DISPLAY_NUMBER = "fldF1GTqeq8BiArqe"  # Inquiries: Inquiry (e.g. "B-1299")
+ FLD_CLIENT_DISPLAY_NAME = "fldrMb8nojLXI7daC"  # Clients: Сокращённое наименование
++FLD_ORDER_GRAF_NAME = "fldBr8hx2jto2sjv4"      # orders GRAF: Name
++FLD_ORDER_CHINA_NAME = "fldLNHN6PsUdu3gDr"     # orders CHINA: Name
+ 
+ OUR_COMPANY_NAME = "РОСМА"  # used in generated filenames, e.g. "B-1299_РОСМА.pdf"
+ 
+@@ -164,6 +170,10 @@ def _display_id_for_filename(table_id, record, record_id):
+         value = resolver._field(record, FLD_INQ_DISPLAY_NUMBER)
+     elif table_id == CLIENTS_TABLE:
+         value = resolver._field(record, FLD_CLIENT_DISPLAY_NAME)
++    elif table_id == ORDERS_GRAF_TABLE:
++        value = resolver._field(record, FLD_ORDER_GRAF_NAME)
++    elif table_id == ORDERS_CHINA_TABLE:
++        value = resolver._field(record, FLD_ORDER_CHINA_NAME)
+     else:
+         value = None
+     return str(value).strip() if value else record_id
+@@ -194,9 +204,68 @@ TABLE_FIELD_MAP = {
+         "result_attachment": None,
+         "result_docx_link": "fldcxiKZRBvdohDGj",  # Clients: Ссылка на DOCX договора
+     },
++    # Supplier orders: ONE table, TWO documents (with / without clients), each
++    # with its own trigger checkbox and result fields -- so the per-template
++    # part lives under "templates" and is merged over the shared part by
++    # _fmap(). Status/error are shared per table. The trigger checkboxes are
++    # the existing «Create PDF ...» ones (the old DocsAutomator automations on
++    # them must be switched off / repointed to the docgen webhook, otherwise
++    # both fire). Result: URL field + the existing attachment field (the new
++    # PDF is APPENDED to the attachments, older files are kept).
++    ORDERS_GRAF_TABLE: {
++        "template_link": None,
++        "status": "fldIrykgrqgpAQs3H",
++        "error": "fldNOra24XFGSVjU7",
++        "result_docx_link": None,
++        "templates": {
++            "Заказ GRAF с клиентами": {
++                "trigger": "fldQd3TdfXUq6pZ9j",
++                "result_link": "fldg5CAuotgLWel1z",
++                "result_attachment": "fldOvCmmbLDmpA83L",
++            },
++            "Заказ GRAF без клиентов": {
++                "trigger": "fldEgzQfqp9OAjeXH",
++                "result_link": "fldaUhPZdMYHjDxjK",
++                "result_attachment": "fldMgLYuHmrLfqVXV",
++            },
++        },
++    },
++    ORDERS_CHINA_TABLE: {
++        "template_link": None,
++        "status": "fldAN8Zv679Gc8WdS",
++        "error": "fldXk4axRzVHCLtnY",
++        "result_docx_link": None,
++        "templates": {
++            "Заказ Китай с клиентами": {
++                "trigger": "fldVVdKxGIZVFSftf",
++                "result_link": "fldUeFvVYR7bjk3DE",
++                "result_attachment": "flddq4A4WKwf6v2Ku",
++            },
++            "Заказ Китай без клиентов": {
++                "trigger": "fldpHX1NqLr7AmBNE",
++                "result_link": "fldZHFAZEE0EZIRpC",
++                "result_attachment": "fld9g9eQpnwKu7Jiv",
++            },
++        },
++    },
+ }
+ 
+ 
++def _fmap(table_id, template_name=None):
++    """Field map for one table, with the per-template overrides (supplier
++    orders) merged in. Tables without "templates" return their map as is."""
++    base = dict(TABLE_FIELD_MAP[table_id])
++    per_template = base.pop("templates", None)
++    if per_template:
++        if template_name not in per_template:
++            raise ValueError(
++                f"Template {template_name!r} is not configured for table {table_id} "
++                f"(known: {', '.join(per_template)})"
++            )
++        base.update(per_template[template_name])
++    return base
++
++
+ def _airtable_request(method, url, **kwargs):
+     """Shared by _update_record/_create_record. Airtable rate-limits at 5
+     req/sec per base; build_context() alone does many reads in a tight
+@@ -249,18 +318,27 @@ def _log_update_for_generation(inquiry_record_id, type_value, pdf_url, docx_url)
+     )
+ 
+ 
+-def _set_status(table_id, record_id, status, error_text=None, reset_trigger=False):
+-    fmap = TABLE_FIELD_MAP[table_id]
++def _set_status(table_id, record_id, status, error_text=None, reset_trigger=False, template_name=None):
++    try:
++        fmap = _fmap(table_id, template_name)
++    except ValueError:
++        # Unknown template for a multi-template table: still write status/error.
++        fmap = {k: v for k, v in TABLE_FIELD_MAP[table_id].items() if k != "templates"}
+     fields = {fmap["status"]: status}
+     if error_text is not None:
+         fields[fmap["error"]] = error_text
+-    if reset_trigger:
++    if reset_trigger and fmap.get("trigger"):
+         fields[fmap["trigger"]] = False
+     _update_record(table_id, record_id, fields)
+ 
+ 
+ def _get_template_name(table_id, record):
+     fmap = TABLE_FIELD_MAP[table_id]
++    if table_id in ORDER_TABLES:
++        raise ValueError(
++            "Supplier-order tables need template_name in the webhook payload "
++            "(\"Заказ GRAF с клиентами\" etc.) -- one table drives two documents."
++        )
+     if fmap.get("template_link"):
+         links = resolver._field(record, fmap["template_link"], [])
+         if not links:
+@@ -296,7 +374,7 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
+     """
+     table_id = _detect_table(record_id, table_id)
+     try:
+-        _set_status(table_id, record_id, "В процессе", error_text="")
++        _set_status(table_id, record_id, "В процессе", error_text="", template_name=template_name)
+ 
+         record = resolver._get_record(table_id, record_id)
+         if not template_name:
+@@ -333,7 +411,7 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
+         remote_filename = f"{base_filename}.pdf"
+         public_url = yd.upload_and_publish(pdf_path, remote_filename)
+ 
+-        fmap = TABLE_FIELD_MAP[table_id]
++        fmap = _fmap(table_id, template_name)
+         docx_url = None
+         if fmap.get("result_docx_link"):
+             # Clients-scoped documents get a DOCX link on the record itself.
+@@ -353,7 +431,13 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
+             # Airtable fetches and stores its own copy given a URL -- gives
+             # a one-click download right on the record, on top of the plain
+             # link field every table already gets.
+-            result_fields[fmap["result_attachment"]] = [{"url": public_url}]
++            # APPEND to what is already attached (older order PDFs are kept):
++            # existing attachments are passed back by id, the new one by url.
++            existing = resolver._field(record, fmap["result_attachment"], []) or []
++            result_fields[fmap["result_attachment"]] = (
++                [{"id": a["id"]} for a in existing if isinstance(a, dict) and a.get("id")]
++                + [{"url": public_url}]
++            )
+         _update_record(table_id, record_id, result_fields)
+ 
+         # Log an Updates row for every document type (КП, Спецификация,
+@@ -364,7 +448,9 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
+         # shouldn't undo the successful generation above, so it's caught
+         # and swallowed rather than turning the whole run into an "Ошибка".
+         log_inquiry_id = _inquiry_id_for_log(table_id, record, record_id)
+-        if not log_inquiry_id:
++        if table_id in ORDER_TABLES:
++            pass  # supplier orders: no single Inquiry to log against, by design
++        elif not log_inquiry_id:
+             # Most likely a Договор поставки generation for a Client with
+             # no linked Inquiry (see _inquiry_id_for_log) -- nothing to
+             # hang an Updates row off of. Printed for the same reason as
+@@ -413,7 +499,8 @@ def generate_document_for_record(record_id, table_id=None, template_name=None):
+     except Exception as exc:
+         error_text = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+         try:
+-            _set_status(table_id, record_id, "Ошибка", error_text=error_text[:9000], reset_trigger=True)
++            _set_status(table_id, record_id, "Ошибка", error_text=error_text[:9000],
++                        reset_trigger=True, template_name=template_name)
+         except Exception:
+             pass  # don't let a failed status write mask the original error
+         return {"ok": False, "record_id": record_id, "error": str(exc)}
+-- 
+2.43.0
+
