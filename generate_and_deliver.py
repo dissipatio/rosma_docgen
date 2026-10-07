@@ -210,8 +210,8 @@ TABLE_FIELD_MAP = {
     # _fmap(). Status/error are shared per table. The trigger checkboxes are
     # the existing «Create PDF ...» ones (the old DocsAutomator automations on
     # them must be switched off / repointed to the docgen webhook, otherwise
-    # both fire). Result: URL field + the existing attachment field (the new
-    # PDF is APPENDED to the attachments, older files are kept).
+    # both fire). Result: two URL fields only -- PDF link and DOCX link
+    # (no attachment copies, same as Clients).
     ORDERS_GRAF_TABLE: {
         "template_link": None,
         "status": "fldIrykgrqgpAQs3H",
@@ -221,12 +221,14 @@ TABLE_FIELD_MAP = {
             "Заказ GRAF с клиентами": {
                 "trigger": "fldQd3TdfXUq6pZ9j",
                 "result_link": "fldg5CAuotgLWel1z",
-                "result_attachment": "fldOvCmmbLDmpA83L",
+                "result_attachment": None,
+                "result_docx_link": "fldWQrZXQyWj0b0HP",
             },
             "Заказ GRAF без клиентов": {
                 "trigger": "fldEgzQfqp9OAjeXH",
                 "result_link": "fldaUhPZdMYHjDxjK",
-                "result_attachment": "fldMgLYuHmrLfqVXV",
+                "result_attachment": None,
+                "result_docx_link": "fldsMHghwrfxS0XIS",
             },
         },
     },
@@ -239,12 +241,14 @@ TABLE_FIELD_MAP = {
             "Заказ Китай с клиентами": {
                 "trigger": "fldVVdKxGIZVFSftf",
                 "result_link": "fldUeFvVYR7bjk3DE",
-                "result_attachment": "flddq4A4WKwf6v2Ku",
+                "result_attachment": None,
+                "result_docx_link": "fldkXpgZWuYHmeYWi",
             },
             "Заказ Китай без клиентов": {
                 "trigger": "fldpHX1NqLr7AmBNE",
                 "result_link": "fldZHFAZEE0EZIRpC",
-                "result_attachment": "fld9g9eQpnwKu7Jiv",
+                "result_attachment": None,
+                "result_docx_link": "fldP394mpzrxpxkEK",
             },
         },
     },
