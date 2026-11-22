@@ -25,6 +25,7 @@ from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
+import callcounter
 from pdf_convert import docx_to_pdf
 
 logging.basicConfig(
@@ -34,6 +35,14 @@ logging.basicConfig(
 log = logging.getLogger("docgen")
 
 app = FastAPI(title="ROSMA docgen")
+
+# Count Airtable API calls (log hourly; Telegram report if TELEGRAM_BOT_TOKEN is set)
+callcounter.install("docgen")
+
+
+@app.on_event("startup")
+def _start_call_counter() -> None:
+    callcounter.start_reporter(default_chat="-5211187399")
 
 
 # --------------------------------------------------------------------------
